@@ -1,5 +1,7 @@
 //! Bottle EQ: a system-wide audio equalizer for Windows.
 //!
+//!   bottle-eq [window] [--from <device>] [--to <device>]   the window: the live spectrum, the curve and
+//!                                                      its points to drag, the modes, Flat, Start and Stop
 //!   bottle-eq devices                                  the output devices, their formats and blocks
 //!   bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other
 //!   bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
@@ -25,11 +27,17 @@
 //! While `run` plays, a line sets the curve: "mode rock", "modes", "points 100:cut 12k:+8:spike", "1k +3",
 //! "31.5 -2", "8 4" (the 8th band), "flat", "off", "on"; an empty line stops.
 //!
-//! Step 2 of 5: the equalizer.
+//! The window begins at once when --exclusive or --shared is given with both devices; else it waits for
+//! Start. For trying it out: --file <wav> [--level x] is played to the source, --drag <point>:<hz>:<dB>
+//! drags a point there by itself, and --shot <bmp> [--seconds n] keeps a picture of the window and closes.
+//!
+//! Steps 1 to 5 of 5.
 
 mod eq;
 mod ring;
+mod spectrum;
 mod wasapi;
+mod window;
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -268,6 +276,7 @@ fn main() {
     let (file, record) = (take("--file"), take("--record"));
     let level: f32 = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number"))).unwrap_or(1.0);
     let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
+    let (shot, drag) = (take("--shot"), take("--drag"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
     let mut flag = |f: &str| match args.iter().position(|a| a == f) {
         Some(i) => {
@@ -295,6 +304,28 @@ fn main() {
     };
 
     match args.first().map(String::as_str) {
+        None | Some("window") => {
+            let drag = drag.map(|d| {
+                let parts: Vec<&str> = d.split(':').collect();
+                match parts.as_slice() {
+                    [i, hz, db] => (i.parse::<usize>().ok().filter(|i| *i >= 1).zip(hz_of(hz)).zip(db.parse::<f32>().ok())).map(|((i, hz), db)| (i - 1, hz, db)),
+                    _ => None,
+                }
+                .unwrap_or_else(|| fail("--drag takes point:frequency:dB, like 3:10k:+8"))
+            });
+            let start = window::Start {
+                from,
+                to,
+                exclusive: if exclusive { Some(true) } else if shared { Some(false) } else { None },
+                cushion_ms,
+                settings: gains,
+                mode: mode_text,
+                play: file.map(|f| (f, level)),
+                drag,
+                shot: shot.map(|path| (path, seconds.unwrap_or(4.0))),
+            };
+            window::open(start).unwrap_or_else(|e| fail(&e));
+        }
         Some("devices") => {
             for (i, o) in outputs().unwrap_or_else(|e| fail(&e)).iter().enumerate() {
                 let ms = |frames: u32| frames as f32 * 1000.0 / o.rate as f32;
@@ -539,6 +570,6 @@ fn main() {
                 println!("kept: {dir}/captured.wav (what came from the source), {dir}/handed.wav (what the target was given)");
             }
         }
-        _ => fail("commands: devices | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
+        _ => fail("commands: window | devices | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
     }
 }

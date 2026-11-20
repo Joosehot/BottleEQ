@@ -1,15 +1,55 @@
 # Bottle EQ
 
-A system-wide audio equalizer for Windows with a live visualizer, in Rust. Built in five steps; steps 1
-and 2 are done.
+A system-wide audio equalizer for Windows with a live visualizer, in Rust. Built in five steps; all five
+are made, and nobody has yet sat with it and listened.
 
 1. **Audio capture** (done): what Windows plays is captured by WASAPI loopback and played back out,
    5.8 ms later.
 2. **EQ engine** (done): ten bands, 20 modes, and points as in FL Studio's parametric EQ.
-3. "Flat" button, with a hook for per-device correction curves (`flat` and `modes.txt` are there; the
-   button comes with the window).
-4. Visualizer: an always-on-top window with the live spectrum and the EQ curve.
-5. Draggable curve.
+3. **"Flat" button** (done), with a hook for per-device correction curves (`modes.txt`).
+4. **Visualizer** (done): an always-on-top window with the live spectrum and the EQ curve on one graph.
+5. **Draggable curve** (done): the bands and the points are dragged with the mouse.
+
+## The window
+
+![The window](docs/window.png)
+
+`bottle-eq` (or `bottle-eq window --from "S/PDIF" --to "Speakers"`) opens it (`src/window.rs`). It stays
+on top of other windows. Choose where the sound is captured from and where it is played, and press Start.
+
+One graph, from 20 Hz to 20 kHz on a logarithmic axis:
+
+- **green: the live spectrum** of the sound the target is being given (so after the equalizer), its
+  level in dB on the right-hand scale. 4096 samples at a time (85 ms, bins 11.7 Hz apart), Hann window;
+  a level rises at once and falls 30 dB a second (`src/spectrum.rs`);
+- **amber: the equalizer's curve**, its gain in dB on the left-hand scale, with its handles:
+  - the **small squares** are the ten bands: drag one up or down for that band's gain;
+  - the **round points** are the free ones, as in FL Studio: drag one sideways for its frequency and up
+    or down for its gain. The wheel over a point is its width. The right button on a point is its kind
+    (a slope at the start or the end, a shelf, a peak, a spike) or takes it away; the right button or a
+    double click on the empty graph makes a new point there (eight at most).
+
+The sound changes while a handle is dragged: every move goes to the audio thread at once, which slides
+to it without a click. **Mode** sets the ten bands; **Flat** puts every band at 0 dB and the points back
+where they began (three of them at 0 dB): the sound then passes bit for bit as it came. **on** unticked
+lets the sound pass untouched whatever is set, to hear the difference. The line at the bottom is the
+delay, how far the sound is turned down for headroom, and the gaps so far.
+
+Crates: `windows` (the audio), `rustfft` (the spectrum), `eframe`/egui (the window).
+
+Checked:
+
+- `cargo test`: the graph's places and frequencies agree both ways; the pointer takes the nearest handle
+  within reach, a point before a band it lies on; a point dragged to 10 kHz and +8 dB is there and the
+  curve is raised there; a slope follows the pointer only sideways; a sine stands in the spectrum at its
+  frequency and level and falls 30 dB a second after it ends.
+- In the running window (the picture above): Bach played to S/PDIF, a slope at 90 Hz, a dip, and a
+  spike at 11 kHz that the window's own test (`--drag 3:12k:+9`: press, twelve moves, release, given to
+  egui as pointer events) dragged to 12 kHz and +9 dB while the music played; the spectrum shows the
+  slope and the spike in the sound. Delay 5.0 ms on average, 6.9 ms at the longest, no gap.
+
+Not done: no hand has dragged it yet and nobody has listened. The devices chosen are not remembered
+from one opening to the next. Run by double click, a console window opens beside it.
 
 ## The equalizer
 
@@ -122,6 +162,7 @@ through the `windows` crate.
 ## Use
 
 ```
+bottle-eq                                          the window
 bottle-eq devices                                  the output devices, their formats and blocks
 bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other (Enter stops)
 bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
