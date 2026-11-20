@@ -681,6 +681,7 @@ unsafe fn direct(
     let silence = vec![0.0f32; 4096 * in_ch];
     let mut sound = vec![0.0f32; room as usize * out_ch];
     let (mut phase, mut usual, mut lean, mut last, mut noise) = (0.0f64, cushion as f64, 0.0f64, 0.0f32, 0x2545_F491u32);
+    let mut settling = 200u32;
     while !stop.load(Ordering::Relaxed) {
         if WaitForSingleObject(event, 100) != WAIT_OBJECT_0 {
             continue;
@@ -710,6 +711,16 @@ unsafe fn direct(
 
             // how much is queued at the target right now
             let mut queued = out.GetCurrentPadding()?;
+            // The device takes a few milliseconds to begin taking sound, and what is written meanwhile
+            // would stay queued as delay (3.4 ms here, gone only after 20 s of reading fast). So for the
+            // first half second, a block that would put the queue over the cushion is not written.
+            if settling > 0 {
+                settling -= 1;
+                if queued > cushion {
+                    store.skip(store.len().saturating_sub((sinc.needs() - 1) * in_ch) / in_ch * in_ch);
+                    continue;
+                }
+            }
             if queued == 0 {
                 // the device ran out: there is a gap in the sound. Begin again from the cushion.
                 m.dry.fetch_add(1, Ordering::Relaxed);

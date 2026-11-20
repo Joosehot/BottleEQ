@@ -1,14 +1,51 @@
 # Bottle EQ
 
-A system-wide audio equalizer for Windows with a live visualizer, in Rust. Built in five steps; step 1
-is done.
+A system-wide audio equalizer for Windows with a live visualizer, in Rust. Built in five steps; steps 1
+and 2 are done.
 
 1. **Audio capture** (done): what Windows plays is captured by WASAPI loopback and played back out,
-   untouched.
-2. EQ engine: a bank of biquad filters, 10 bands.
+   5.8 ms later.
+2. **EQ engine** (done): a bank of ten biquad filters, written here.
 3. "Flat" button, with a hook for per-device correction curves.
 4. Visualizer: an always-on-top window with the live spectrum and the EQ curve.
 5. Draggable curve.
+
+## The equalizer
+
+Ten bands at the octave centres 31.5, 63, 125, 250, 500, 1k, 2k, 4k, 8k and 16k Hz (`src/eq.rs`). The
+lowest is a low shelf, the highest a high shelf, the eight between are peaks one octave wide; each can
+be set from -12 to +12 dB. They are RBJ's biquads in the shape of Vuuvee's `dsp/biquad.rs` (direct form
+I, 64-bit), one after another, run in the audio thread on each block just before it is handed to the
+target.
+
+- **Flat is exact.** A band at 0 dB is skipped, so with every band at 0 the equalizer leaves the sound
+  bit for bit as it came.
+- **No clicks when a gain is set.** Gains are set from another thread through a few atomics; the audio
+  thread moves each band 0.25 dB a block (about 3 ms) toward its set gain.
+- **No clipping.** The whole sound is turned down by the highest point of the curve (headroom), so a
+  raised band cannot push a full-scale sound over. Raising bands therefore makes the rest quieter.
+
+```
+bottle-eq run --from "S/PDIF" --to "Speakers" --gains 4,2,0,0,0,0,0,0,2,4
+bottle-eq curve --gains 4,2,0,0,0,0,0,0,2,4      # the curve those gains make
+```
+
+While `run` plays, a line sets a band: `1k +3`, `31.5 -2`, `8 4` (the 8th band), `flat`, `off`, `on`; an
+empty line stops.
+
+Measured:
+
+- `cargo test`: 7 tests. Flat leaves the sound as it came; a peak is its gain at its centre, half of it
+  half an octave away and nothing far away; the shelves raise the ends; a sine through the filters comes
+  out at what the curve says within 0.05 dB at ten frequencies; every band at +12 or -12 stays sound;
+  the headroom keeps a full-scale sine at full scale; a gain set while playing does not click.
+- In the running path (`tools/eqcheck.py`): 20 s of pink noise played to S/PDIF with the gains
+  6, 0, -4, 0, 3, -6, 0, 4, 0, -3, and the spectrum of what the speakers were given over the spectrum of
+  what was captured, against the curve: over 108 points from 30 Hz to 18 kHz the mean difference is
+  0.01 dB and the biggest 0.05 dB (at 101 Hz); the headroom is -5.06 dB where the curve's top is
+  +5.07 dB. No gap, delay 5.9 ms on average and 8.1 ms at the longest.
+
+Not done: nobody has heard it.
 
 ## How the sound gets through (WASAPI loopback)
 
@@ -117,6 +154,13 @@ python tools/spectra.py test/out/captured.wav test/out/handed.wav   # band again
   3 dB (at 0.73 s, where the two files are least well lined up), none by 6 dB: no click or gap shows.
 - The sinc reads 16 frames behind the newest sound (0.33 ms), which is counted in the delay: 5.8 ms on
   average, 9.9 ms at the longest, for this piece.
+- The one window that differed by more than 3 dB (0.725 to 0.811 s) holds the very first note of the
+  piece (0.788 s). Lined up on its own it differs by 0.00 to 0.01 dB in every band: it was 163 frames
+  off the place the whole file was lined up to, because the delay was 3.4 ms longer at the start than
+  later (the device takes a few milliseconds to begin taking sound, and what was written meanwhile
+  stayed queued until 20 s of reading fast had used it up). For the first half second a block that
+  would put the queue over the cushion is now not written; the longest delay in the next run was
+  8.1 ms.
 
 Not done: nobody has listened yet, and what the speakers themselves made of it was not recorded (there
 are microphones on this machine; they were not used). `test/out/handed.wav` is what the speakers were

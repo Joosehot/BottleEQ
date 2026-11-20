@@ -13,8 +13,16 @@
 //!   --cushion-ms <n>         sound kept queued on top of what the devices' blocks need (default 2)
 //!   --seconds <n>            run: stop by itself; selftest: the tone's length
 //!
-//! Step 1 of 5: the stream flows, nothing is done to it yet.
+//!   --gains <ten numbers>    the ten bands' gains in dB, low to high, e.g. --gains 4,2,0,0,0,0,0,0,2,4
+//!
+//!   bottle-eq curve --gains <ten numbers>              the curve those gains make, every third of an octave
+//!
+//! While `run` plays, a line sets a band: "1k +3", "31.5 -2", "8 4" (the 8th band), "flat", "off", "on";
+//! an empty line stops.
+//!
+//! Step 2 of 5: the equalizer.
 
+mod eq;
 mod ring;
 mod wasapi;
 
@@ -22,6 +30,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use eq::{Eq, Gains, BANDS, CENTRES};
 use wasapi::{find, outputs, run, value, Output, Running};
 
 fn fail(msg: &str) -> ! {
@@ -128,6 +137,36 @@ fn write_wav(path: &str, rate: u32, channels: usize, samples: &[f32]) -> Result<
     std::fs::write(path, out).map_err(|e| format!("{path}: {e}"))
 }
 
+/// The gains given with --gains, as ten numbers in dB.
+fn parse_gains(text: &str) -> [f32; BANDS] {
+    let given: Vec<f32> = text.split(',').map(|g| g.trim().parse().unwrap_or_else(|_| fail("--gains takes ten numbers, like 4,2,0,0,0,0,0,0,2,4"))).collect();
+    if given.len() != BANDS {
+        fail(&format!("--gains takes {BANDS} numbers, one for each band ({} were given)", given.len()));
+    }
+    std::array::from_fn(|b| given[b])
+}
+
+/// A band named as its place (1 to 10) or its centre ("31.5", "1k", "16000").
+fn band_of(name: &str) -> Option<usize> {
+    let hz: f32 = match name.to_lowercase().strip_suffix('k') {
+        Some(thousands) => thousands.parse::<f32>().ok()? * 1000.0,
+        None => name.parse().ok()?,
+    };
+    if hz.fract() == 0.0 && (1.0..=BANDS as f32).contains(&hz) {
+        return Some(hz as usize - 1);
+    }
+    CENTRES.iter().position(|c| (c / hz).log2().abs() < 0.25)
+}
+
+fn show_gains(gains: &Gains, rate: u32) {
+    let set = gains.get();
+    let names: Vec<String> = CENTRES.iter().zip(set).map(|(c, g)| format!("{}:{g:+.1}", if *c >= 1000.0 { format!("{}k", c / 1000.0) } else { format!("{c}") })).collect();
+    match gains.on.load(Ordering::Relaxed) {
+        true => println!("bands (dB): {}  | turned down {:.1} dB for headroom", names.join(" "), -eq::headroom(&set, rate as f64)),
+        false => println!("bands (dB): {}  | off: the sound passes untouched", names.join(" ")),
+    }
+}
+
 fn describe(running: &Running, source: &Output, target: &Output) {
     let o = &running.opened;
     println!("capturing what plays to: {}  (in blocks of {} frames, {:.2} ms)", source.name, o.in_block, o.in_block as f32 * 1000.0 / running.in_rate as f32);
@@ -157,6 +196,7 @@ fn main() {
     let cushion_ms: f32 = take("--cushion-ms").map(|s| s.parse().unwrap_or_else(|_| fail("--cushion-ms takes a number"))).unwrap_or(2.0);
     let (file, record) = (take("--file"), take("--record"));
     let level: f32 = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number"))).unwrap_or(1.0);
+    let gains_text = take("--gains");
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
     let mut flag = |f: &str| match args.iter().position(|a| a == f) {
         Some(i) => {
@@ -166,6 +206,9 @@ fn main() {
         None => false,
     };
     let (exclusive, shared) = (flag("--exclusive"), flag("--shared"));
+    let gains = Arc::new(Gains::default());
+    let given = gains_text.map(|g| parse_gains(&g));
+    given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
     let pair = || {
         let (Some(from), Some(to)) = (&from, &to) else { fail("give --from <device> and --to <device> (see `bottle-eq devices`)") };
         (find(from).unwrap_or_else(|e| fail(&e)), find(to).unwrap_or_else(|e| fail(&e)))
@@ -200,14 +243,31 @@ fn main() {
                 let _ = std::io::stdin().read_line(&mut answer);
                 !answer.trim().to_lowercase().starts_with('n')
             });
-            let running = run(&source, &target, cushion_ms, take_it, |_, _| {}, |_, _| {}).unwrap_or_else(|e| fail(&e));
+            let (mut equalizer, g) = (Eq::new(target.rate), gains.clone());
+            let running = run(&source, &target, cushion_ms, take_it, |_, _| {}, move |sound, channels| equalizer.process(sound, channels, &g)).unwrap_or_else(|e| fail(&e));
             describe(&running, &source, &target);
-            println!("Press Enter to stop.");
+            show_gains(&gains, target.rate);
+            println!("A line sets a band (\"1k +3\", \"flat\", \"off\", \"on\"); an empty line stops.");
             let stop = Arc::new(AtomicBool::new(false));
-            let s = stop.clone();
-            std::thread::spawn(move || {
-                let _ = std::io::stdin().read_line(&mut String::new());
-                s.store(true, Ordering::Relaxed);
+            let (s, g, rate) = (stop.clone(), gains.clone(), target.rate);
+            std::thread::spawn(move || loop {
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    s.store(true, Ordering::Relaxed);
+                    return;
+                }
+                let words: Vec<&str> = line.split_whitespace().collect();
+                match words.as_slice() {
+                    ["flat"] => g.flat(),
+                    ["off"] => g.on.store(false, Ordering::Relaxed),
+                    ["on"] => g.on.store(true, Ordering::Relaxed),
+                    [band, db] => match (band_of(band), db.parse::<f32>()) {
+                        (Some(band), Ok(db)) => g.set(band, db),
+                        _ => println!("not understood: a band is 1 to 10 or its centre (31.5 ... 16k), then its gain in dB"),
+                    },
+                    _ => println!("not understood: \"1k +3\", \"flat\", \"off\", \"on\", or an empty line to stop"),
+                }
+                show_gains(&g, rate);
             });
             let began = Instant::now();
             let m = &running.meters;
@@ -292,6 +352,25 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("curve") => {
+            // the curve the gains make: every third of an octave, or every twelfth as "hz,dB" with --csv
+            let set = gains.get();
+            let (rate, csv) = (48000.0, args.iter().any(|a| a == "--csv"));
+            if !csv {
+                show_gains(&gains, rate as u32);
+            }
+            let step = if csv { 12 } else { 3 };
+            for i in 0..=10 * step {
+                let hz = 20.0 * 2f64.powf(i as f64 / step as f64);
+                if hz < 0.45 * rate {
+                    let db = eq::response_db(&set, rate, hz);
+                    match csv {
+                        true => println!("{hz:.2},{db:.3}"),
+                        false => println!("{hz:>8.0} Hz {db:>+6.2} dB  {}", "#".repeat(((db + 12.0) * 2.0).round().max(0.0) as usize)),
+                    }
+                }
+            }
+        }
         Some("playtest") => {
             // real music through the whole path, with what was captured and what was handed to the target
             // kept as two WAV files to look at and to listen to
@@ -307,6 +386,8 @@ fn main() {
             let captured = Arc::new(Mutex::new(Vec::<f32>::with_capacity(room * source.rate as usize * source.channels)));
             let handed = Arc::new(Mutex::new((Vec::<f32>::with_capacity(room * target.rate as usize * 2), 2usize)));
             let (c, h) = (captured.clone(), handed.clone());
+            let (mut equalizer, g) = (Eq::new(target.rate), gains.clone());
+            show_gains(&gains, target.rate);
             let running = run(
                 &source,
                 &target,
@@ -319,6 +400,7 @@ fn main() {
                     }
                 },
                 move |sound, channels| {
+                    equalizer.process(sound, channels, &g);
                     let mut h = h.lock().unwrap();
                     h.1 = channels;
                     if h.0.len() + sound.len() <= h.0.capacity() {
@@ -357,6 +439,6 @@ fn main() {
                 println!("kept: {dir}/captured.wav (what came from the source), {dir}/handed.wav (what the target was given)");
             }
         }
-        _ => fail("commands: devices | run --from <device> --to <device> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
+        _ => fail("commands: devices | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
     }
 }
