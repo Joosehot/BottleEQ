@@ -151,6 +151,7 @@ struct Window {
     graph: Rect,
     /// what the path says of itself, looked at twice a second
     looked: Instant,
+    looks: u32,
     delay: (f32, f32),
     said: String,
     // trying it out
@@ -201,6 +202,24 @@ impl Window {
         }
     }
 
+    /// What stands in the way of hearing anything, said in the graph where it is seen.
+    fn notice(&self) -> Option<String> {
+        if !self.said.is_empty() {
+            return Some(self.said.clone());
+        }
+        let (Some(s), Some(_)) = (self.source, self.target) else {
+            return Some("Choose where the sound is captured from (From) and the speakers it is played to (to).".to_string());
+        };
+        if !self.outputs[s].default {
+            let plays = self.outputs.iter().find(|o| o.default).map_or("another device".to_string(), |o| format!("\"{}\"", o.name));
+            return Some(format!(
+                "Windows plays to {plays}, not to \"{}\".\nOnly what plays to \"{}\" passes through Bottle EQ:\nchoose it as the Windows output device (the speaker icon on the taskbar).",
+                self.outputs[s].name, self.outputs[s].name
+            ));
+        }
+        self.running.is_none().then(|| "Press Start.".to_string())
+    }
+
     fn rate(&self) -> f64 {
         self.target.map_or(48000.0, |t| self.outputs[t].rate as f64)
     }
@@ -230,10 +249,14 @@ impl Window {
                 });
                 ui.label("to");
                 egui::ComboBox::from_id_salt("to").width(170.0).selected_text(name(&self.outputs, self.target)).show_ui(ui, |ui| {
-                    for (i, o) in self.outputs.iter().enumerate() {
+                    // every device but the source: its own sound cannot be played back to it
+                    for (i, o) in self.outputs.iter().enumerate().filter(|(i, _)| Some(*i) != self.source) {
                         ui.selectable_value(&mut self.target, Some(i), o.name.clone());
                     }
                 });
+                if self.target == self.source {
+                    self.target = None;
+                }
                 ui.checkbox(&mut self.exclusive, "exclusive").on_hover_text("Take the target for Bottle EQ alone: the delay is then about 6 ms instead of 44, and nothing else can play to that device meanwhile.");
             });
             if was != (self.source, self.target, self.exclusive) {
@@ -281,10 +304,7 @@ impl Window {
                     m.dry.load(Ordering::Relaxed) + m.dropped.load(Ordering::Relaxed)
                 )
             }
-            (None, _) => match self.source.is_some_and(|s| !self.outputs[s].default) {
-                true => "stopped   (Windows does not play to the source now: only what plays there is heard here)".to_string(),
-                false => "stopped".to_string(),
-            },
+            (None, _) => "stopped".to_string(),
         };
         ui.label(egui::RichText::new(text).small());
     }
@@ -442,6 +462,12 @@ impl Window {
                 label(at, point_text(&curve, i));
             }
         }
+        if let Some(notice) = self.notice() {
+            let at = pos2(graph.center().x, graph.top() + 22.0);
+            let size = painter.text(at, egui::Align2::CENTER_TOP, &notice, FontId::proportional(13.0), Color32::TRANSPARENT);
+            painter.rect_filled(size.expand(8.0), 4.0, Color32::from_black_alpha(215));
+            painter.text(at, egui::Align2::CENTER_TOP, &notice, FontId::proportional(13.0), Color32::WHITE);
+        }
     }
 
     /// A new point where the pointer is: a peak, or by its place a shelf if it is now the outermost.
@@ -512,6 +538,13 @@ impl eframe::App for Window {
             if let Some(running) = &self.running {
                 self.delay = running.delay();
             }
+            // every two seconds: which device Windows plays to now (asked in a thread of its own, as in `open`)
+            self.looks += 1;
+            if self.looks % 4 == 0 {
+                if let Ok(Ok(now)) = std::thread::spawn(wasapi::outputs).join() {
+                    self.outputs.iter_mut().for_each(|o| o.default = now.iter().any(|n| n.id == o.id && n.default));
+                }
+            }
         }
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
@@ -556,7 +589,7 @@ pub fn open(start: Start) -> Result<(), String> {
     };
     // not said: captured from where Windows plays, and played to the other device if there is one other
     let source = find(&start.from)?.or(outputs.iter().position(|o| o.default));
-    let target = find(&start.to)?;
+    let target = find(&start.to)?.filter(|t| Some(*t) != source);
     if start.settings.get().points().is_empty() {
         start.settings.set_points(&first_points());
     }
@@ -579,6 +612,7 @@ pub fn open(start: Start) -> Result<(), String> {
         menu: (None, Pos2::ZERO),
         graph: Rect::ZERO,
         looked: Instant::now(),
+        looks: 0,
         delay: (0.0, 0.0),
         said: String::new(),
         opened: Instant::now(),
