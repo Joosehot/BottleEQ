@@ -330,14 +330,22 @@ impl Window {
             }
             painter.text(pos2(graph.left() - 6.0, y), egui::Align2::RIGHT_CENTER, if db == 0.0 { "0".to_string() } else { format!("{db:+.0}") }, small.clone(), AMBER);
         }
-        painter.text(pos2(response.rect.left() + 2.0, graph.top() - 18.0), egui::Align2::LEFT_TOP, "EQ gain (dB)", small.clone(), AMBER);
+        painter.text(pos2(response.rect.left() + 2.0, graph.top() - 18.0), egui::Align2::LEFT_TOP, "EQ (dB): above 0 louder, below quieter", small.clone(), AMBER);
         // right: the spectrum's level, in the spectrum's colour
         for level in [0.0, -30.0, -60.0, -90.0f32] {
             let y = graph.bottom() - (level - DEEP) / -DEEP * graph.height();
             painter.text(pos2(graph.right() + 6.0, y), egui::Align2::LEFT_CENTER, format!("{level:.0}"), small.clone(), GREEN);
         }
-        painter.text(pos2(response.rect.right() - 2.0, graph.top() - 18.0), egui::Align2::RIGHT_TOP, "sound level (dB)", small.clone(), GREEN);
+        painter.text(pos2(response.rect.right() - 2.0, graph.top() - 18.0), egui::Align2::RIGHT_TOP, "the sound now (dB)", small.clone(), GREEN);
         let painter = painter.with_clip_rect(graph);
+        // what the frequencies are, in words
+        for (from, to, name) in [(20.0, 60.0, "sub bass"), (60.0, 250.0, "bass"), (250.0, 2000.0, "mids"), (2000.0, 6000.0, "upper mids"), (6000.0, 20000.0, "treble")] {
+            let (left, right) = (x_of(graph, from), x_of(graph, to));
+            if to < HIGH {
+                painter.line_segment([pos2(right, graph.top()), pos2(right, graph.top() + 16.0)], Stroke::new(1.0, Color32::from_gray(110)));
+            }
+            painter.text(pos2((left + right) / 2.0, graph.top() + 3.0), egui::Align2::CENTER_TOP, name, small.clone(), Color32::from_gray(170));
+        }
 
         // the spectrum: at each two points across, the highest level among the bins that fall there
         // (below 200 Hz the bins are further apart than that: the level between two bins)
@@ -438,11 +446,16 @@ impl Window {
             })
             .collect();
         let colour = if on { AMBER } else { Color32::from_gray(120) };
-        painter.line(drawn, Stroke::new(2.0, colour));
+        // between the 0 dB line and the curve it is filled: above the line that much louder, below quieter
+        let zero = y_of(graph, 0.0);
+        for at in &drawn {
+            painter.line_segment([pos2(at.x, zero), *at], Stroke::new(2.0, colour.gamma_multiply(0.22)));
+        }
+        painter.line(drawn, Stroke::new(2.5, colour));
         let lit = |hold: Hold| self.held == Some(hold) || (self.held.is_none() && under == Some(hold));
         let label = |at: Pos2, text: String| {
             let (side, x) = if at.x > graph.center().x { (egui::Align2::RIGHT_BOTTOM, at.x - 10.0) } else { (egui::Align2::LEFT_BOTTOM, at.x + 10.0) };
-            painter.text(pos2(x, (at.y - 8.0).max(graph.top() + 16.0)), side, text, FontId::proportional(12.0), Color32::WHITE);
+            painter.text(pos2(x, (at.y - 8.0).max(graph.top() + 34.0)), side, text, FontId::proportional(12.0), Color32::WHITE);
         };
         // the ten bands: small squares
         for b in 0..BANDS {
@@ -463,7 +476,7 @@ impl Window {
             }
         }
         if let Some(notice) = self.notice() {
-            let at = pos2(graph.center().x, graph.top() + 22.0);
+            let at = pos2(graph.center().x, graph.top() + 44.0);
             let size = painter.text(at, egui::Align2::CENTER_TOP, &notice, FontId::proportional(13.0), Color32::TRANSPARENT);
             painter.rect_filled(size.expand(8.0), 4.0, Color32::from_black_alpha(215));
             painter.text(at, egui::Align2::CENTER_TOP, &notice, FontId::proportional(13.0), Color32::WHITE);
