@@ -50,6 +50,11 @@ impl Ring {
         samples[(self.read.load(Ordering::Relaxed) + offset) % samples.len()]
     }
 
+    /// Samples read so far, in all.
+    pub fn read_total(&self) -> usize {
+        self.read.load(Ordering::Relaxed)
+    }
+
     /// The reader: move past `n` samples.
     pub fn skip(&self, n: usize) {
         self.read.fetch_add(n, Ordering::Release);
