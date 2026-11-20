@@ -20,8 +20,11 @@ on top of other windows. Choose where the sound is captured from and where it is
 One graph, from 20 Hz to 20 kHz on a logarithmic axis:
 
 - **green: the live spectrum** of the sound the target is being given (so after the equalizer), its
-  level in dB on the right-hand scale. 4096 samples at a time (85 ms, bins 11.7 Hz apart), Hann window;
-  a level rises at once and falls 30 dB a second (`src/spectrum.rs`);
+  level in dB on the right-hand scale. 8192 samples at a time (171 ms, bins 5.9 Hz apart), Hann window;
+  a level rises at once and falls 30 dB a second (`src/spectrum.rs`). What is drawn is the level of the
+  sixth of an octave around each frequency (the bins' power there added up), so it is one smooth line:
+  level for sound with as much power in every octave, as most music roughly has, and bent where the
+  equalizer raises or lowers it;
 - **amber: the equalizer's curve**, its gain in dB on the left-hand scale, with its handles:
   - the **small squares** are the ten bands: drag one up or down for that band's gain;
   - the **round points** are the free ones, as in FL Studio: drag one sideways for its frequency and up

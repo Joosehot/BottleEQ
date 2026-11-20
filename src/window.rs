@@ -28,7 +28,7 @@ use crate::wasapi::{self, run, Output, Running};
 const LOW: f32 = 20.0;
 const HIGH: f32 = 20000.0;
 const SPAN: f32 = 18.0;
-const DEEP: f32 = -90.0;
+const DEEP: f32 = -72.0;
 /// how near a point the pointer takes hold of it, in screen points
 const REACH: f32 = 14.0;
 /// a spike's width
@@ -332,7 +332,7 @@ impl Window {
         }
         painter.text(pos2(response.rect.left() + 2.0, graph.top() - 18.0), egui::Align2::LEFT_TOP, "EQ (dB): above 0 louder, below quieter", small.clone(), AMBER);
         // right: the spectrum's level, in the spectrum's colour
-        for level in [0.0, -30.0, -60.0, -90.0f32] {
+        for level in [0.0, -24.0, -48.0, -72.0f32] {
             let y = graph.bottom() - (level - DEEP) / -DEEP * graph.height();
             painter.text(pos2(graph.right() + 6.0, y), egui::Align2::LEFT_CENTER, format!("{level:.0}"), small.clone(), GREEN);
         }
@@ -347,26 +347,21 @@ impl Window {
             painter.text(pos2((left + right) / 2.0, graph.top() + 3.0), egui::Align2::CENTER_TOP, name, small.clone(), Color32::from_gray(170));
         }
 
-        // the spectrum: at each two points across, the highest level among the bins that fall there
-        // (below 200 Hz the bins are further apart than that: the level between two bins)
+        // the sound now: at each two points across, the level of the sixth of an octave around that
+        // frequency, so it is one smooth line (level for sound with as much power in every octave)
         let rate = self.rate() as f32;
-        let level_at = |hz: f32| {
-            let place = (hz * SIZE as f32 / rate).min((SIZE / 2 - 1) as f32);
-            let (bin, part) = (place as usize, place.fract());
-            self.spectrum.levels[bin] * (1.0 - part) + self.spectrum.levels[bin + 1] * part
-        };
+        let sixth = 2f32.powf(1.0 / 12.0);
         let steps = (graph.width() / 2.0) as usize;
         let mut line = Vec::with_capacity(steps + 1);
         for step in 0..=steps {
             let x = graph.left() + step as f32 * 2.0;
-            let (from, to) = (hz_at(graph, x - 1.0), hz_at(graph, x + 1.0));
-            let (first, last) = ((from * SIZE as f32 / rate).ceil() as usize, ((to * SIZE as f32 / rate) as usize).min(SIZE / 2));
-            let level = if last > first { self.spectrum.levels[first..=last].iter().copied().fold(DEEP, f32::max) } else { level_at(hz_at(graph, x)) };
+            let hz = hz_at(graph, x);
+            let level = self.spectrum.band(hz / sixth, hz * sixth, rate);
             let y = graph.bottom() - ((level - DEEP) / -DEEP).clamp(0.0, 1.0) * graph.height();
             painter.line_segment([pos2(x, graph.bottom()), pos2(x, y)], Stroke::new(2.0, GREEN.gamma_multiply(0.28)));
             line.push(pos2(x, y));
         }
-        painter.line(line, Stroke::new(1.0, GREEN));
+        painter.line(line, Stroke::new(2.0, GREEN));
 
         // the pointer and the handles
         let curve = self.settings.get();

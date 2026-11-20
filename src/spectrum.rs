@@ -4,14 +4,22 @@
 //! keeps the last `SIZE` of them, and on each look windows them (Hann), transforms them (rustfft, as
 //! Vuuvee's `dsp/fft.rs` does) and reads each bin's level in dB, where a full-scale sine is 0 dB.
 //! A level rises at once and falls slowly, so the picture can be read.
+//!
+//! What is drawn is not the bins themselves (thousands of needles) but `band`: the power of all the
+//! bins between two frequencies, added up. Read over a band a sixth of an octave wide that slides along
+//! the axis, it is one smooth line; a full-scale sine is still 0 dB, and sound with as much power in
+//! every octave (pink noise, and roughly most music) is a level line, so what the equalizer raises or
+//! lowers shows as the line bending.
 
 use std::sync::Arc;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use crate::ring::Ring;
 
-/// samples in one transform: at 48 kHz 85 ms of sound, bins 11.7 Hz apart
-pub const SIZE: usize = 4096;
+/// samples in one transform: at 48 kHz 171 ms of sound, bins 5.9 Hz apart
+pub const SIZE: usize = 8192;
+/// a sine's power lies over this many bins of a Hann window (its noise bandwidth)
+const SPREAD: f32 = 1.5;
 /// the lowest level kept, in dB
 pub const FLOOR: f32 = -100.0;
 /// how fast a level falls, in dB a second
@@ -57,6 +65,22 @@ impl Spectrum {
         ring.skip(n);
     }
 
+    /// The level of the sound between two frequencies, in dB: the bins' power there added up (between
+    /// two bins: the power on the line from one to the other).
+    pub fn band(&self, from: f32, to: f32, rate: f32) -> f32 {
+        let top = (SIZE / 2) as f32;
+        let (a, b) = ((from * SIZE as f32 / rate).clamp(0.0, top), (to * SIZE as f32 / rate).clamp(0.0, top));
+        let power = |place: f32| {
+            let bin = (place as usize).min(SIZE / 2 - 1);
+            let (low, high) = (10f32.powf(self.levels[bin] / 10.0), 10f32.powf(self.levels[bin + 1] / 10.0));
+            low + (high - low) * (place - bin as f32)
+        };
+        // two looks a bin, evenly across the band
+        let n = 2 * ((b - a).ceil() as usize).max(1);
+        let mean = (0..=n).map(|i| power(a + (b - a) * i as f32 / n as f32)).sum::<f32>() / (n + 1) as f32;
+        (10.0 * (mean * (b - a) / SPREAD).max(1e-12).log10()).max(FLOOR)
+    }
+
     /// Look: the levels now, `seconds` after the last look.
     pub fn look(&mut self, seconds: f32) {
         for (i, c) in self.work.iter_mut().enumerate() {
@@ -90,6 +114,11 @@ mod tests {
         // 0.5 is -6.02 dB; between two bins a Hann window reads up to 1.4 dB low
         assert!(s.levels[top] < -6.0 && s.levels[top] > -7.5, "the top is {} dB", s.levels[top]);
         assert!(s.levels[top + 40] < -80.0, "far from the sine there is {} dB", s.levels[top + 40]);
+        // the sixth of an octave around the sine holds all of it: -6 dB; the sixth beside it nothing
+        let sixth = 2f32.powf(1.0 / 12.0);
+        let around = s.band(hz / sixth, hz * sixth, rate);
+        assert!((around - -6.02).abs() < 0.5, "the band around the sine is {around} dB");
+        assert!(s.band(hz * sixth * sixth, hz * sixth.powi(4), rate) < -60.0);
         // silence after it: the level falls 30 dB in a second, not at once
         ring.push(&vec![0.0; SIZE]);
         s.take(&ring);
