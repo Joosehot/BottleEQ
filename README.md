@@ -84,7 +84,38 @@ tone alone moves 0.0013 a frame), with no break reported by Windows; the path pa
 It is either this test's tone or the source's engine at its short period. `selftest` says so when it
 sees it.
 
-Not done: nobody has listened yet. Every number here is from the samples, not from ears.
+### With music
+
+`playtest` plays a WAV file to the source and keeps what was captured and what the target was given:
+
+```
+bottle-eq playtest --from "S/PDIF" --to "Speakers" --exclusive --file test/music.wav --level 0.1 --record test/out
+python tools/compare.py test/music.wav test/out/captured.wav 0.1    # wave against wave
+python tools/spectra.py test/out/captured.wav test/out/handed.wav   # band against band
+```
+
+40 s of Bach's Toccata and Fugue in D minor, BWV 565 (a public-domain recording from Wikimedia Commons,
+`Toccata_et_Fugue_BWV565.ogg`, performed by Ashtar Moïra), played 20 dB down:
+
+- No gap anywhere: ran out 0 times, 0 dropped, 0 late, 0 breaks. Delay 5.3 ms on average after the first
+  3 s, 10.4 ms at the longest (the queue at its fullest and a whole period's wait at once).
+- **Played -> captured** (the source side): the same sound, wave for wave (alike 1.00000 in every 43 ms
+  window but the first, where the comparison had not yet found its place), 0.78 dB lower: the S/PDIF
+  device's own volume setting, most likely.
+- **Captured -> given to the speakers** (Bottle EQ itself), level by octave band over the whole piece:
+
+  | band (Hz) | 31.5 | 63 | 125 | 250 | 500 | 1k | 2k | 4k | 8k | 16k |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | dB | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | -0.01 | -0.12 | -0.78 |
+
+  Flat to 4 kHz; the top octave loses 0.8 dB. That is the 4-point read between the samples (the two
+  clocks); a longer one (Vuuvee has a resampler) would give it back. Window by window (937 of 85 ms) no
+  band differs by more than 6 dB, 4 windows differ by 3 to 6 dB (all in the first 6 s, where the two
+  files are least well lined up): no click or gap shows.
+
+Not done: nobody has listened yet, and what the speakers themselves made of it was not recorded (there
+are microphones on this machine; they were not used). `test/out/handed.wav` is what the speakers were
+given, to listen to.
 
 What the devices allow (`cargo run --release --example periods`): S/PDIF shared blocks down to 2.67 ms;
 the USB speakers 10 ms shared, 3 ms exclusive. The monitor's output has no speakers.

@@ -320,7 +320,7 @@ unsafe fn pro_audio() -> bool {
 }
 
 /// The capture thread: the source's engine at its least period, and its mix by loopback into the ring.
-unsafe fn capture(source: &Output, ring: &Ring, m: &Meters, stop: &AtomicBool, ready: &Sender<Result<u32, String>>) -> Win<()> {
+unsafe fn capture(source: &Output, ring: &Ring, listen: &mut dyn FnMut(&[f32], usize), m: &Meters, stop: &AtomicBool, ready: &Sender<Result<u32, String>>) -> Win<()> {
     let dev = device(&source.id)?;
     // a silent stream at the least period: while it runs, the engine mixes (and loopback arrives) in
     // blocks that short
@@ -360,6 +360,7 @@ unsafe fn capture(source: &Output, ring: &Ring, m: &Meters, stop: &AtomicBool, r
             m.stamp_frames.store(frames_so_far, Ordering::Relaxed);
             m.stamp_time.store(now(), Ordering::Relaxed);
             let fitted = ring.push(samples) / ch;
+            listen(samples, ch);
             frames_so_far += fitted as u64;
             m.captured.fetch_add(fitted as u64, Ordering::Relaxed);
             m.dropped.fetch_add((n as usize - fitted) as u64, Ordering::Relaxed);
@@ -569,7 +570,17 @@ unsafe fn playback(
 /// is not filled at its events: whenever a block comes from the source (every 2.67 ms) it is read at the
 /// target's rate, processed and written straight in behind what is already queued. What is queued is
 /// held, on average, at a little over what the device takes in one period.
-unsafe fn direct(source: &Output, target: &Output, cushion_ms: f32, process: &mut dyn FnMut(&mut [f32], usize), m: &Meters, stop: &AtomicBool, ready: &Sender<Result<Opened, String>>) -> Win<()> {
+#[allow(clippy::too_many_arguments)]
+unsafe fn direct(
+    source: &Output,
+    target: &Output,
+    cushion_ms: f32,
+    listen: &mut dyn FnMut(&[f32], usize),
+    process: &mut dyn FnMut(&mut [f32], usize),
+    m: &Meters,
+    stop: &AtomicBool,
+    ready: &Sender<Result<Opened, String>>,
+) -> Win<()> {
     // the target first: if exclusive mode is not to be had, say why and leave
     let out_dev = device(&target.id)?;
     let (out, format_bits, period) = match exclusive(&out_dev, target, true) {
@@ -632,6 +643,7 @@ unsafe fn direct(source: &Output, target: &Output, cushion_ms: f32, process: &mu
             }
             let samples: &[f32] = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 { &silence[..(n as usize * in_ch).min(silence.len())] } else { std::slice::from_raw_parts(data as *const f32, n as usize * in_ch) };
             let fitted = store.push(samples) / in_ch;
+            listen(samples, in_ch);
             m.captured.fetch_add(fitted as u64, Ordering::Relaxed);
             let (mut peak, mut jump) = (value(&m.peak_in), value(&m.jump_in));
             for (i, frame) in samples.chunks(in_ch).enumerate() {
@@ -711,8 +723,16 @@ unsafe fn direct(source: &Output, target: &Output, cushion_ms: f32, process: &mu
 
 /// Capture the source's mix by loopback and play it to the target. `cushion_ms` is the sound kept in
 /// the ring on top of what the two devices' blocks need. `process` is called in the playback thread on
-/// every block of interleaved output frames just before it is played.
-pub fn run(source: &Output, target: &Output, cushion_ms: f32, want_exclusive: bool, process: impl FnMut(&mut [f32], usize) + Send + 'static) -> Result<Running, String> {
+/// every block of interleaved output frames just before it is played; `listen` is called in the capture
+/// thread on every block of interleaved frames as it arrives from the source.
+pub fn run(
+    source: &Output,
+    target: &Output,
+    cushion_ms: f32,
+    want_exclusive: bool,
+    listen: impl FnMut(&[f32], usize) + Send + 'static,
+    process: impl FnMut(&mut [f32], usize) + Send + 'static,
+) -> Result<Running, String> {
     if source.id == target.id {
         return Err("the source and the target are the same device: loopback is a copy of what that device plays, so playing it back there would double it and feed it round again".to_string());
     }
@@ -721,16 +741,17 @@ pub fn run(source: &Output, target: &Output, cushion_ms: f32, want_exclusive: bo
     let mut threads = Vec::new();
     // `process` goes to whichever thread plays
     let process = Arc::new(std::sync::Mutex::new(process));
+    let listen = Arc::new(std::sync::Mutex::new(listen));
     let mut why_not = String::new();
 
     if want_exclusive {
         let (said, heard) = channel::<Result<Opened, String>>();
-        let (src, tgt, m, s, pr) = (source.clone(), target.clone(), meters.clone(), stop.clone(), process.clone());
+        let (src, tgt, m, s, pr, li) = (source.clone(), target.clone(), meters.clone(), stop.clone(), process.clone(), listen.clone());
         let thread = std::thread::spawn(move || unsafe {
             m.priority.fetch_add(2 * pro_audio() as u64, Ordering::Relaxed);
             // this thread alone uses `process` from here on: the lock is taken once and kept
-            let mut process = pr.lock().unwrap();
-            if let Err(e) = direct(&src, &tgt, cushion_ms, &mut *process, &m, &s, &said) {
+            let (mut process, mut listen) = (pr.lock().unwrap(), li.lock().unwrap());
+            if let Err(e) = direct(&src, &tgt, cushion_ms, &mut *listen, &mut *process, &m, &s, &said) {
                 let _ = said.send(Err(e.to_string()));
                 eprintln!("the audio thread stopped: {e}");
             }
@@ -751,10 +772,11 @@ pub fn run(source: &Output, target: &Output, cushion_ms: f32, want_exclusive: bo
     let ring = Arc::new(Ring::new(source.rate as usize * source.channels)); // one second
 
     let (said, heard) = channel::<Result<u32, String>>();
-    let (src, r, m, s) = (source.clone(), ring.clone(), meters.clone(), stop.clone());
+    let (src, r, m, s, li) = (source.clone(), ring.clone(), meters.clone(), stop.clone(), listen.clone());
     threads.push(std::thread::spawn(move || unsafe {
         m.priority.fetch_add(pro_audio() as u64, Ordering::Relaxed);
-        if let Err(e) = capture(&src, &r, &m, &s, &said) {
+        let mut listen = li.lock().unwrap();
+        if let Err(e) = capture(&src, &r, &mut *listen, &m, &s, &said) {
             let _ = said.send(Err(format!("loopback capture on {}: {e}", src.name)));
             eprintln!("capture stopped: {e}");
         }
@@ -837,6 +859,52 @@ pub fn tone(output: &Output, hz: f64, level: f32, seconds: f64) -> JoinHandle<()
         };
         if let Err(e) = play() {
             eprintln!("tone on {}: {e}", output.name);
+        }
+    })
+}
+
+/// Play sound to an output like any program would (shared mode): a fifth of a second of silence, then
+/// `sound` (interleaved, two channels, at the output's rate), and done.
+pub fn play(output: &Output, sound: Vec<f32>) -> JoinHandle<()> {
+    let output = output.clone();
+    std::thread::spawn(move || unsafe {
+        let play = || -> Win<()> {
+            let client: IAudioClient = device(&output.id)?.Activate(CLSCTX_ALL, None)?;
+            let format = client.GetMixFormat()?;
+            client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 2_000_000, 0, format, None)?;
+            let render: IAudioRenderClient = client.GetService()?;
+            let room = client.GetBufferSize()?;
+            client.Start()?;
+            let ch = output.channels;
+            let lead = output.rate as usize / 5;
+            let frames = lead + sound.len() / 2;
+            let mut n = 0usize;
+            while n < frames {
+                let free = room - client.GetCurrentPadding()?;
+                if free > 0 {
+                    let out = std::slice::from_raw_parts_mut(render.GetBuffer(free)? as *mut f32, free as usize * ch);
+                    for frame in out.chunks_mut(ch) {
+                        frame.fill(0.0);
+                        if n >= lead && n < frames {
+                            frame[0] = sound[2 * (n - lead)];
+                            if ch > 1 {
+                                frame[1] = sound[2 * (n - lead) + 1];
+                            }
+                        }
+                        n += 1;
+                    }
+                    render.ReleaseBuffer(free, 0)?;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            while client.GetCurrentPadding()? > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            client.Stop()
+        };
+        if let Err(e) = play() {
+            eprintln!("playing to {}: {e}", output.name);
         }
     })
 }

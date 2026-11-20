@@ -3,6 +3,9 @@
 //!   bottle-eq devices                                  the output devices, their formats and blocks
 //!   bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other
 //!   bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
+//!   bottle-eq playtest --from <device> --to <device> --file <wav> [--record <folder>] [--level <0..1>]
+//!                                                      music through the whole path; what was captured and
+//!                                                      what the target was given are kept as WAV files
 //!
 //! A device is its number in `devices` or a part of its name. Options:
 //!   --exclusive | --shared   take the target for Bottle EQ alone (short delay) or share it (long delay);
@@ -72,6 +75,59 @@ impl Heard {
     }
 }
 
+/// A WAV file as (rate, interleaved two-channel float samples). Float 32 and 16-bit PCM are read; a
+/// mono file goes to both channels, further channels are left out.
+fn read_wav(path: &str) -> Result<(u32, Vec<f32>), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a WAV file".to_string());
+    }
+    let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    let (mut at, mut format) = (12, None);
+    while at + 8 <= bytes.len() {
+        let (name, size) = (&bytes[at..at + 4], u32_at(at + 4) as usize);
+        let body = at + 8;
+        if name == b"fmt " {
+            let tag = if u16_at(body) == 0xFFFE { u16_at(body + 24) } else { u16_at(body) };
+            format = Some((tag, u16_at(body + 2) as usize, u32_at(body + 4), u16_at(body + 14)));
+        } else if name == b"data" {
+            let (tag, channels, rate, bits) = format.ok_or("no format before the data")?;
+            let data = &bytes[body..(body + size).min(bytes.len())];
+            let samples: Vec<f32> = match (tag, bits) {
+                (3, 32) => data.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+                (1, 16) => data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect(),
+                _ => return Err(format!("format {tag} with {bits} bits is not read (32-bit float and 16-bit PCM are)")),
+            };
+            let two: Vec<f32> = samples.chunks_exact(channels).flat_map(|f| [f[0], f[if channels > 1 { 1 } else { 0 }]]).collect();
+            return Ok((rate, two));
+        }
+        at = body + size + (size & 1);
+    }
+    Err("no sound in the file".to_string())
+}
+
+fn write_wav(path: &str, rate: u32, channels: usize, samples: &[f32]) -> Result<(), String> {
+    let mut out = Vec::with_capacity(44 + samples.len() * 4);
+    let bytes = (samples.len() * 4) as u32;
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + bytes).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&3u16.to_le_bytes());
+    out.extend_from_slice(&(channels as u16).to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * channels as u32 * 4).to_le_bytes());
+    out.extend_from_slice(&(channels as u16 * 4).to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&bytes.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, out).map_err(|e| format!("{path}: {e}"))
+}
+
 fn describe(running: &Running, source: &Output, target: &Output) {
     let o = &running.opened;
     println!("capturing what plays to: {}  (in blocks of {} frames, {:.2} ms)", source.name, o.in_block, o.in_block as f32 * 1000.0 / running.in_rate as f32);
@@ -99,6 +155,8 @@ fn main() {
     };
     let (from, to) = (take("--from"), take("--to"));
     let cushion_ms: f32 = take("--cushion-ms").map(|s| s.parse().unwrap_or_else(|_| fail("--cushion-ms takes a number"))).unwrap_or(2.0);
+    let (file, record) = (take("--file"), take("--record"));
+    let level: f32 = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number"))).unwrap_or(1.0);
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
     let mut flag = |f: &str| match args.iter().position(|a| a == f) {
         Some(i) => {
@@ -142,7 +200,7 @@ fn main() {
                 let _ = std::io::stdin().read_line(&mut answer);
                 !answer.trim().to_lowercase().starts_with('n')
             });
-            let running = run(&source, &target, cushion_ms, take_it, |_, _| {}).unwrap_or_else(|e| fail(&e));
+            let running = run(&source, &target, cushion_ms, take_it, |_, _| {}, |_, _| {}).unwrap_or_else(|e| fail(&e));
             describe(&running, &source, &target);
             println!("Press Enter to stop.");
             let stop = Arc::new(AtomicBool::new(false));
@@ -179,7 +237,7 @@ fn main() {
             let length = seconds.unwrap_or(1.5) as f64;
             let heard = Arc::new(Mutex::new(Heard::default()));
             let (h, rate) = (heard.clone(), target.rate as f64);
-            let running = run(&source, &target, cushion_ms, !shared, move |sound, channels| h.lock().unwrap().hear(sound, channels, HZ, rate)).unwrap_or_else(|e| fail(&e));
+            let running = run(&source, &target, cushion_ms, !shared, |_, _| {}, move |sound, channels| h.lock().unwrap().hear(sound, channels, HZ, rate)).unwrap_or_else(|e| fail(&e));
             describe(&running, &source, &target);
             std::thread::sleep(Duration::from_millis(400));
             if heard.lock().unwrap().began {
@@ -234,6 +292,71 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        _ => fail("commands: devices | run --from <device> --to <device> | selftest --from <device> --to <device>"),
+        Some("playtest") => {
+            // real music through the whole path, with what was captured and what was handed to the target
+            // kept as two WAV files to look at and to listen to
+            let (source, target) = pair();
+            let file = file.unwrap_or_else(|| fail("playtest needs --file <wav: two channels, 32-bit float, at the source's rate>"));
+            let (rate, mut music) = read_wav(&file).unwrap_or_else(|e| fail(&format!("{file}: {e}")));
+            if rate != source.rate {
+                fail(&format!("{file} is at {rate} Hz and the source at {} Hz", source.rate));
+            }
+            music.iter_mut().for_each(|s| *s *= level);
+            let seconds = music.len() as f64 / 2.0 / rate as f64;
+            let room = (seconds + 3.0) as usize;
+            let captured = Arc::new(Mutex::new(Vec::<f32>::with_capacity(room * source.rate as usize * source.channels)));
+            let handed = Arc::new(Mutex::new((Vec::<f32>::with_capacity(room * target.rate as usize * 2), 2usize)));
+            let (c, h) = (captured.clone(), handed.clone());
+            let running = run(
+                &source,
+                &target,
+                cushion_ms,
+                !shared,
+                move |sound, _| {
+                    let mut c = c.lock().unwrap();
+                    if c.len() + sound.len() <= c.capacity() {
+                        c.extend_from_slice(sound);
+                    }
+                },
+                move |sound, channels| {
+                    let mut h = h.lock().unwrap();
+                    h.1 = channels;
+                    if h.0.len() + sound.len() <= h.0.capacity() {
+                        h.0.extend_from_slice(sound);
+                    }
+                },
+            )
+            .unwrap_or_else(|e| fail(&e));
+            describe(&running, &source, &target);
+            std::thread::sleep(Duration::from_millis(500));
+            println!("playing {file} ({seconds:.0} s, at {level} of its level) to the source ...");
+            let playing = wasapi::play(&source, music);
+            std::thread::sleep(Duration::from_secs(3));
+            let _ = running.delay();
+            let _ = playing.join();
+            let (mean, longest) = running.delay();
+            std::thread::sleep(Duration::from_millis(500));
+            let m = &running.meters;
+            println!(
+                "{} frames captured, {} played, {} dropped, ran dry {} times, woken late {} times, {} breaks in what was captured, read {:+.0} ppm off nominal at the end",
+                m.captured.load(Ordering::Relaxed),
+                m.played.load(Ordering::Relaxed),
+                m.dropped.load(Ordering::Relaxed),
+                m.dry.load(Ordering::Relaxed),
+                m.late.load(Ordering::Relaxed),
+                m.breaks.load(Ordering::Relaxed),
+                value(&m.drift_ppm)
+            );
+            println!("delay after the first 3 s: {mean:.1} ms on average, {longest:.1} ms at the longest");
+            println!("peaks: {} dB captured, {} dB handed to the target", db(value(&m.peak_in)), db(value(&m.peak_out)));
+            if let Some(dir) = record {
+                let _ = std::fs::create_dir_all(&dir);
+                let (c, h) = (captured.lock().unwrap(), handed.lock().unwrap());
+                write_wav(&format!("{dir}/captured.wav"), source.rate, source.channels, &c).unwrap_or_else(|e| fail(&e));
+                write_wav(&format!("{dir}/handed.wav"), target.rate, h.1, &h.0).unwrap_or_else(|e| fail(&e));
+                println!("kept: {dir}/captured.wav (what came from the source), {dir}/handed.wav (what the target was given)");
+            }
+        }
+        _ => fail("commands: devices | run --from <device> --to <device> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
     }
 }
