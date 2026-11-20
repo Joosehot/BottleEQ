@@ -1,6 +1,8 @@
 """Does the equalizer do, in the running path, what its curve says?
 
-    python tools/eqcheck.py <captured.wav> <handed.wav> <ten gains, like 6,0,-4,0,3,-6,0,4,0,-3>
+    python tools/eqcheck.py <captured.wav> <handed.wav> <the curve, as given to bottle-eq>
+
+    e.g. ... --gains 6,0,-4,0,3,-6,0,4,0,-3     or     ... --mode rock --points "100:cut 12k:+8:spike"
 
 Noise is played through Bottle EQ with those gains (`bottle-eq playtest --gains ...`). The spectrum of
 what the target was given, over the spectrum of what was captured, is what the equalizer did. It is set
@@ -25,7 +27,7 @@ def load(path):
 
 a, rate = load(sys.argv[1])
 b, _ = load(sys.argv[2])
-gains = sys.argv[3]
+curve = sys.argv[3:] if sys.argv[3].startswith("--") else ["--gains", sys.argv[3]]
 power = np.cumsum(np.concatenate(([0.0], a * a)))
 loud = int(np.argmax(power[rate:] - power[:-rate]))
 lag = int(np.argmax(correlate(b, a[loud:loud + rate], "valid", method="fft"))) - loud
@@ -36,7 +38,7 @@ a, b = a[start:start + n], b[start + lag:start + lag + n]
 
 f, pa = welch(a, rate, nperseg=32768)
 _, pb = welch(b, rate, nperseg=32768)
-said = [line.split(",") for line in subprocess.run([EXE, "curve", "--gains", gains, "--csv"], capture_output=True, text=True).stdout.split()]
+said = [line.split(",") for line in subprocess.run([EXE, "curve", *curve, "--csv"], capture_output=True, text=True).stdout.split() if "," in line]
 said = [(float(hz), float(db)) for hz, db in said]
 
 rows = []
@@ -47,7 +49,7 @@ for hz, db in said:
 rows = np.array(rows)
 room = np.median(rows[:, 2] - rows[:, 1])
 error = rows[:, 2] - rows[:, 1] - room
-print(f"gains {gains}: {n / rate:.0f} s of noise compared")
+print(f"{' '.join(curve)}: {n / rate:.0f} s of noise compared")
 print(f"  the whole sound is {room:+.2f} dB (headroom); the curve's top is {max(db for _, db in said):+.2f} dB")
 print("      Hz   the curve   the sound   difference")
 for i in range(0, len(rows), 4):

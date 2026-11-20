@@ -14,11 +14,16 @@
 //!   --seconds <n>            run: stop by itself; selftest: the tone's length
 //!
 //!   --gains <ten numbers>    the ten bands' gains in dB, low to high, e.g. --gains 4,2,0,0,0,0,0,0,2,4
+//!   --mode <name>            a mode from modes.txt, e.g. --mode "bass boost"
+//!   --points <points>        points on top of the bands, as in FL Studio's EQ: each a filter of its own,
+//!                            e.g. --points "100:cut 1k:-2 12k:+8:spike" (a slope at the start, a dip, a
+//!                            spike at the end); see `points_of` for how a point is written
 //!
-//!   bottle-eq curve --gains <ten numbers>              the curve those gains make, every third of an octave
+//!   bottle-eq modes                                    the modes
+//!   bottle-eq curve --gains | --mode | --points ...    the curve they make, every third of an octave
 //!
-//! While `run` plays, a line sets a band: "1k +3", "31.5 -2", "8 4" (the 8th band), "flat", "off", "on";
-//! an empty line stops.
+//! While `run` plays, a line sets the curve: "mode rock", "modes", "points 100:cut 12k:+8:spike", "1k +3",
+//! "31.5 -2", "8 4" (the 8th band), "flat", "off", "on"; an empty line stops.
 //!
 //! Step 2 of 5: the equalizer.
 
@@ -30,7 +35,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use eq::{Eq, Gains, BANDS, CENTRES};
+use eq::{Eq, Kind, Point, Settings, BANDS, CENTRES, CUT_Q, POINT_Q};
 use wasapi::{find, outputs, run, value, Output, Running};
 
 fn fail(msg: &str) -> ! {
@@ -146,24 +151,90 @@ fn parse_gains(text: &str) -> [f32; BANDS] {
     std::array::from_fn(|b| given[b])
 }
 
+/// A frequency as written: "31.5", "1k", "16000".
+fn hz_of(text: &str) -> Option<f32> {
+    match text.to_lowercase().strip_suffix('k') {
+        Some(thousands) => Some(thousands.parse::<f32>().ok()? * 1000.0),
+        None => text.parse().ok(),
+    }
+    .filter(|hz| *hz > 0.0)
+}
+
+/// The points of the curve as written, apart by spaces or commas. A point is its frequency, then after
+/// colons its gain in dB, its width, and its kind, of which only the frequency must be there:
+/// "80:+5", "1k:-3:2" (narrower), "100:cut" (the curve starts with a slope), "12k:+8:spike",
+/// "8k:+4:shelf". Kinds: cut, shelf (low or high by which side of 1 kHz the point is), lowcut, highcut,
+/// lowshelf, highshelf, peak, spike (a narrow peak).
+fn points_of(text: &str) -> Result<Vec<Point>, String> {
+    let how = "a point is frequency:dB, like 80:+5 1k:-3 12k:+8:spike, or 100:cut for a slope";
+    let mut points = Vec::new();
+    for word in text.split([' ', ',']).filter(|p| !p.is_empty()) {
+        let mut parts = word.split(':');
+        let hz = parts.next().and_then(hz_of).ok_or(format!("\"{word}\": {how}"))?;
+        let (mut numbers, mut kind, mut narrow) = (Vec::new(), None, false);
+        for part in parts {
+            match (part.parse::<f32>(), part.to_lowercase().as_str()) {
+                (Ok(n), _) => numbers.push(n),
+                (_, "cut") => kind = Some(if hz < 1000.0 { Kind::LowCut } else { Kind::HighCut }),
+                (_, "shelf") => kind = Some(if hz < 1000.0 { Kind::LowShelf } else { Kind::HighShelf }),
+                (_, "lowcut") => kind = Some(Kind::LowCut),
+                (_, "highcut") => kind = Some(Kind::HighCut),
+                (_, "lowshelf") => kind = Some(Kind::LowShelf),
+                (_, "highshelf") => kind = Some(Kind::HighShelf),
+                (_, "peak") => kind = Some(Kind::Peak),
+                (_, "spike") => (kind, narrow) = (Some(Kind::Peak), true),
+                _ => return Err(format!("\"{word}\": {how}")),
+            }
+        }
+        let cut = matches!(kind, Some(Kind::LowCut | Kind::HighCut));
+        // a cut has no gain: a number after it is its width
+        let (db, q) = match (cut, numbers.as_slice()) {
+            (true, [q, ..]) => (0.0, *q),
+            (true, []) => (0.0, CUT_Q),
+            (false, [db, q, ..]) => (*db, *q),
+            (false, [db]) => (*db, if narrow { 6.0 } else { POINT_Q }),
+            (false, []) => (0.0, if narrow { 6.0 } else { POINT_Q }),
+        };
+        points.push(Point { hz, db, q, kind });
+    }
+    if points.is_empty() || points.len() > eq::POINTS {
+        return Err(format!("a curve has from one to {} points; {how}", eq::POINTS));
+    }
+    Ok(points)
+}
+
 /// A band named as its place (1 to 10) or its centre ("31.5", "1k", "16000").
 fn band_of(name: &str) -> Option<usize> {
-    let hz: f32 = match name.to_lowercase().strip_suffix('k') {
-        Some(thousands) => thousands.parse::<f32>().ok()? * 1000.0,
-        None => name.parse().ok()?,
-    };
+    let hz = hz_of(name)?;
     if hz.fract() == 0.0 && (1.0..=BANDS as f32).contains(&hz) {
         return Some(hz as usize - 1);
     }
     CENTRES.iter().position(|c| (c / hz).log2().abs() < 0.25)
 }
 
-fn show_gains(gains: &Gains, rate: u32) {
+fn show_gains(gains: &Settings, rate: u32) {
     let set = gains.get();
-    let names: Vec<String> = CENTRES.iter().zip(set).map(|(c, g)| format!("{}:{g:+.1}", if *c >= 1000.0 { format!("{}k", c / 1000.0) } else { format!("{c}") })).collect();
+    let hz = |hz: f32| if hz >= 1000.0 { format!("{}k", hz / 1000.0) } else { format!("{hz}") };
+    let names: Vec<String> = CENTRES.iter().zip(set.gains).map(|(c, g)| format!("{}:{g:+.1}", hz(*c))).collect();
+    println!("bands (dB): {}", names.join(" "));
+    let points: Vec<String> = (0..set.points().len())
+        .map(|i| {
+            let p = set.points()[i];
+            match set.kind(i) {
+                Kind::LowCut => format!("{} low cut (the curve starts with a slope; width {:.2})", hz(p.hz), p.q),
+                Kind::HighCut => format!("{} high cut (width {:.2})", hz(p.hz), p.q),
+                Kind::LowShelf => format!("{}:{:+.1} low shelf", hz(p.hz), p.db),
+                Kind::HighShelf => format!("{}:{:+.1} high shelf", hz(p.hz), p.db),
+                Kind::Peak => format!("{}:{:+.1} peak (width {:.2})", hz(p.hz), p.db, p.q),
+            }
+        })
+        .collect();
+    if !points.is_empty() {
+        println!("points:     {}", points.join(" | "));
+    }
     match gains.on.load(Ordering::Relaxed) {
-        true => println!("bands (dB): {}  | turned down {:.1} dB for headroom", names.join(" "), -eq::headroom(&set, rate as f64)),
-        false => println!("bands (dB): {}  | off: the sound passes untouched", names.join(" ")),
+        true => println!("            turned down {:.1} dB for headroom", -set.headroom(rate as f64)),
+        false => println!("            off: the sound passes untouched"),
     }
 }
 
@@ -196,7 +267,7 @@ fn main() {
     let cushion_ms: f32 = take("--cushion-ms").map(|s| s.parse().unwrap_or_else(|_| fail("--cushion-ms takes a number"))).unwrap_or(2.0);
     let (file, record) = (take("--file"), take("--record"));
     let level: f32 = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number"))).unwrap_or(1.0);
-    let gains_text = take("--gains");
+    let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
     let mut flag = |f: &str| match args.iter().position(|a| a == f) {
         Some(i) => {
@@ -206,9 +277,18 @@ fn main() {
         None => false,
     };
     let (exclusive, shared) = (flag("--exclusive"), flag("--shared"));
-    let gains = Arc::new(Gains::default());
+    let gains = Arc::new(Settings::default());
     let given = gains_text.map(|g| parse_gains(&g));
     given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
+    // a mode is a named set of the ten bands' gains; points are filters of their own on top
+    if let Some(name) = &mode_text {
+        let mode = eq::mode(name).unwrap_or_else(|e| fail(&e));
+        println!("mode: {}", mode.name);
+        gains.set_all(&mode.gains);
+    }
+    if let Some(text) = &points_text {
+        gains.set_points(&points_of(text).unwrap_or_else(|e| fail(&e)));
+    }
     let pair = || {
         let (Some(from), Some(to)) = (&from, &to) else { fail("give --from <device> and --to <device> (see `bottle-eq devices`)") };
         (find(from).unwrap_or_else(|e| fail(&e)), find(to).unwrap_or_else(|e| fail(&e)))
@@ -247,7 +327,7 @@ fn main() {
             let running = run(&source, &target, cushion_ms, take_it, |_, _| {}, move |sound, channels| equalizer.process(sound, channels, &g)).unwrap_or_else(|e| fail(&e));
             describe(&running, &source, &target);
             show_gains(&gains, target.rate);
-            println!("A line sets a band (\"1k +3\", \"flat\", \"off\", \"on\"); an empty line stops.");
+            println!("A line sets the curve: \"mode rock\" (\"modes\" lists them), \"points 100:cut 1k:-2 12k:+8:spike\", \"1k +3\" (a band), \"flat\", \"off\", \"on\"; an empty line stops.");
             let stop = Arc::new(AtomicBool::new(false));
             let (s, g, rate) = (stop.clone(), gains.clone(), target.rate);
             std::thread::spawn(move || loop {
@@ -258,6 +338,21 @@ fn main() {
                 }
                 let words: Vec<&str> = line.split_whitespace().collect();
                 match words.as_slice() {
+                    ["modes"] => match eq::modes() {
+                        Ok(all) => println!("{}", all.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")),
+                        Err(e) => println!("{e}"),
+                    },
+                    ["mode", name @ ..] if !name.is_empty() => match eq::mode(&name.join(" ")) {
+                        Ok(mode) => {
+                            println!("mode: {}", mode.name);
+                            g.set_all(&mode.gains);
+                        }
+                        Err(e) => println!("{e}"),
+                    },
+                    ["points", points @ ..] if !points.is_empty() => match points_of(&points.join(" ")) {
+                        Ok(points) => g.set_points(&points),
+                        Err(e) => println!("{e}"),
+                    },
                     ["flat"] => g.flat(),
                     ["off"] => g.on.store(false, Ordering::Relaxed),
                     ["on"] => g.on.store(true, Ordering::Relaxed),
@@ -265,7 +360,7 @@ fn main() {
                         (Some(band), Ok(db)) => g.set(band, db),
                         _ => println!("not understood: a band is 1 to 10 or its centre (31.5 ... 16k), then its gain in dB"),
                     },
-                    _ => println!("not understood: \"1k +3\", \"flat\", \"off\", \"on\", or an empty line to stop"),
+                    _ => println!("not understood: \"mode rock\", \"modes\", \"points 100:cut 1k:-2 12k:+8:spike\", \"1k +3\", \"flat\", \"off\", \"on\", or an empty line to stop"),
                 }
                 show_gains(&g, rate);
             });
@@ -352,6 +447,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("modes") => {
+            for mode in eq::modes().unwrap_or_else(|e| fail(&e)) {
+                println!("{:<16} {}", mode.name, mode.gains.iter().map(|g| format!("{g:>+5.0}")).collect::<String>());
+            }
+        }
         Some("curve") => {
             // the curve the gains make: every third of an octave, or every twelfth as "hz,dB" with --csv
             let set = gains.get();
@@ -363,10 +463,10 @@ fn main() {
             for i in 0..=10 * step {
                 let hz = 20.0 * 2f64.powf(i as f64 / step as f64);
                 if hz < 0.45 * rate {
-                    let db = eq::response_db(&set, rate, hz);
+                    let db = set.response_db(rate, hz);
                     match csv {
                         true => println!("{hz:.2},{db:.3}"),
-                        false => println!("{hz:>8.0} Hz {db:>+6.2} dB  {}", "#".repeat(((db + 12.0) * 2.0).round().max(0.0) as usize)),
+                        false => println!("{hz:>8.0} Hz {db:>+6.2} dB  {}", "#".repeat(((db.max(-24.0) + 24.0) * 1.5).round() as usize)),
                     }
                 }
             }

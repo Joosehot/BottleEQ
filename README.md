@@ -5,45 +5,87 @@ and 2 are done.
 
 1. **Audio capture** (done): what Windows plays is captured by WASAPI loopback and played back out,
    5.8 ms later.
-2. **EQ engine** (done): a bank of ten biquad filters, written here.
-3. "Flat" button, with a hook for per-device correction curves.
+2. **EQ engine** (done): ten bands, 20 modes, and points as in FL Studio's parametric EQ.
+3. "Flat" button, with a hook for per-device correction curves (`flat` and `modes.txt` are there; the
+   button comes with the window).
 4. Visualizer: an always-on-top window with the live spectrum and the EQ curve.
 5. Draggable curve.
 
 ## The equalizer
 
-Ten bands at the octave centres 31.5, 63, 125, 250, 500, 1k, 2k, 4k, 8k and 16k Hz (`src/eq.rs`). The
-lowest is a low shelf, the highest a high shelf, the eight between are peaks one octave wide; each can
-be set from -12 to +12 dB. They are RBJ's biquads in the shape of Vuuvee's `dsp/biquad.rs` (direct form
-I, 64-bit), one after another, run in the audio thread on each block just before it is handed to the
-target.
+Two layers make the curve (`src/eq.rs`), both run in the audio thread on each block just before it is
+handed to the target:
 
-- **Flat is exact.** A band at 0 dB is skipped, so with every band at 0 the equalizer leaves the sound
-  bit for bit as it came.
-- **No clicks when a gain is set.** Gains are set from another thread through a few atomics; the audio
-  thread moves each band 0.25 dB a block (about 3 ms) toward its set gain.
+- **Ten bands** at the octave centres 31.5, 63, 125, 250, 500, 1k, 2k, 4k, 8k and 16k Hz: the lowest a
+  low shelf, the highest a high shelf, the eight between peaks one octave wide, each from -12 to +12 dB.
+- **Points, as in FL Studio's parametric EQ**: up to eight filters put anywhere, each with a frequency, a
+  gain, a width and a kind:
+  - a **cut** makes the curve start (or end) with a slope: 12 dB an octave below a low cut. Its width is
+    how sharp the corner is; a sharp one stands up as a ridge before the slope;
+  - a **shelf** raises or lowers everything below (or above) the point;
+  - a **peak** is a bump or a dip around the point; narrow, it is a spike.
+  A point given no kind is a shelf if it is the lowest or the highest of several, else a peak.
+
+They are RBJ's biquads in the shape of Vuuvee's `dsp/biquad.rs` (direct form I, 64-bit), one after
+another.
+
+- **Flat is exact.** A band or point at 0 dB is skipped, so with everything at 0 the sound leaves bit
+  for bit as it came.
+- **No clicks when the curve is set.** It is set from another thread through a few atomics; the audio
+  thread moves each gain 0.25 dB and each frequency 6% a block (about 3 ms) toward what is set.
 - **No clipping.** The whole sound is turned down by the highest point of the curve (headroom), so a
-  raised band cannot push a full-scale sound over. Raising bands therefore makes the rest quieter.
+  raised curve cannot push a full-scale sound over. Raising part of it therefore makes the rest quieter.
+
+### Modes
+
+A mode is a named set of the ten bands' gains. There are 20 in `modes.txt`: Flat, Bass Boost, Deep
+Bass, Bass Reducer, Treble Boost, Treble Reducer, Loudness, Classical, Rock, Pop, Jazz, Electronic,
+Hip-Hop, Acoustic, Vocal, Speech, Movie, Gaming, Night, Small Speakers. They are starting shapes, not
+measured for any speaker and not taken from any other program; the file is meant to be edited, and a
+`modes.txt` in the folder Bottle EQ is run from is read instead of the one built in. A correction curve
+for one pair of speakers is a line there like any other (the hook of step 3).
+
+A mode sets the bands; the points stay as they are, on top of it. `flat` sets every band and point to
+0 dB and takes the cuts away.
 
 ```
-bottle-eq run --from "S/PDIF" --to "Speakers" --gains 4,2,0,0,0,0,0,0,2,4
-bottle-eq curve --gains 4,2,0,0,0,0,0,0,2,4      # the curve those gains make
+bottle-eq modes
+bottle-eq run --from "S/PDIF" --to "Speakers" --mode rock
+bottle-eq run --from "S/PDIF" --to "Speakers" --points "100:cut 1k:-2 12k:+8:spike"
+bottle-eq curve --mode "bass boost" --points "100:cut:1.5 12k:+8:spike"      # the curve they make
+bottle-eq run ... --gains 4,2,0,0,0,0,0,0,2,4                                # the ten bands by hand
 ```
 
-While `run` plays, a line sets a band: `1k +3`, `31.5 -2`, `8 4` (the 8th band), `flat`, `off`, `on`; an
-empty line stops.
+A point is written `frequency:dB`, then optionally its width and its kind: `80:+5`, `1k:-3:2` (narrower),
+`100:cut` (a slope at the start), `100:cut:1.5` (with a ridge), `12k:+8:spike`, `8k:+4:shelf`. Kinds:
+`cut`, `shelf` (low or high by which side of 1 kHz), `lowcut`, `highcut`, `lowshelf`, `highshelf`, `peak`,
+`spike`.
+
+While `run` plays, a line sets the curve: `mode rock`, `modes`, `points 100:cut 12k:+8:spike`, `1k +3`
+(one band), `flat`, `off`, `on`; an empty line stops. In the window of steps 4 and 5 the points are what
+is dragged.
 
 Measured:
 
-- `cargo test`: 7 tests. Flat leaves the sound as it came; a peak is its gain at its centre, half of it
-  half an octave away and nothing far away; the shelves raise the ends; a sine through the filters comes
-  out at what the curve says within 0.05 dB at ten frequencies; every band at +12 or -12 stays sound;
-  the headroom keeps a full-scale sine at full scale; a gain set while playing does not click.
-- In the running path (`tools/eqcheck.py`): 20 s of pink noise played to S/PDIF with the gains
-  6, 0, -4, 0, 3, -6, 0, 4, 0, -3, and the spectrum of what the speakers were given over the spectrum of
-  what was captured, against the curve: over 108 points from 30 Hz to 18 kHz the mean difference is
-  0.01 dB and the biggest 0.05 dB (at 101 Hz); the headroom is -5.06 dB where the curve's top is
-  +5.07 dB. No gap, delay 5.9 ms on average and 8.1 ms at the longest.
+- `cargo test`: 11 tests. Flat leaves the sound as it came (also with points standing at 0 dB); a band's
+  peak is its gain at its centre, half of it half an octave away and nothing far away; the shelves raise
+  the ends; points are shelves at the ends and peaks between, in whatever order they are given; a cut is
+  -3 dB at its corner and 12 dB an octave below, a sharp one a ridge, a narrow peak a spike; a sine
+  through bands and points together comes out at what the curve says within 0.05 dB at eleven
+  frequencies; everything at +12 or -12 stays sound; the headroom keeps a full-scale sine at full scale;
+  bands and points set, dragged and taken away while playing do not click; the 20 modes read and are
+  found by name; flat takes the cuts away and keeps the points where they are.
+- In the running path (`tools/eqcheck.py`: 20 s of pink noise played to S/PDIF, the spectrum of what the
+  speakers were given over the spectrum of what was captured, against the curve, at 108 points from
+  30 Hz to 18 kHz):
+
+  | curve | mean difference | biggest |
+  |---|---|---|
+  | `--gains 6,0,-4,0,3,-6,0,4,0,-3` | 0.01 dB | 0.05 dB at 101 Hz |
+  | `--mode "bass boost" --points "100:cut:1.5 1k:-2 12k:+8:spike"` | 0.03 dB | 0.37 dB at 11.5 kHz |
+
+  (The 0.37 dB is on the flank of the narrow spike, where the measuring band, a twelfth of an octave, is
+  wide against the curve's bend.) No gap, delay 5.9 ms on average and 8.1 ms at the longest.
 
 Not done: nobody has heard it.
 

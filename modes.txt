@@ -1,0 +1,29 @@
+# Bottle EQ's modes: a name, then the ten bands' gains in dB, low to high:
+#
+#                   31.5   63  125  250  500   1k   2k   4k   8k  16k
+#
+# The lowest and the highest band are shelves (they move everything below 31.5 Hz and above 16 kHz).
+# Edit freely, add lines, or keep a modes.txt of your own in the folder Bottle EQ is run from: it is
+# read instead of this one. A correction curve for one pair of speakers is a line here like any other.
+# These are starting shapes drawn by ear-of-thumb, not measured for any speaker.
+
+Flat             =     0    0    0    0    0    0    0    0    0    0
+Bass Boost       =     6    5    4    2    0    0    0    0    0    0
+Deep Bass        =     8    6    2    0    0    0    0    0    0    0
+Bass Reducer     =    -6   -5   -4   -2    0    0    0    0    0    0
+Treble Boost     =     0    0    0    0    0    0    2    4    5    6
+Treble Reducer   =     0    0    0    0    0    0   -2   -4   -5   -6
+Loudness         =     6    4    2    0   -1   -1    0    1    3    5
+Classical        =     2    2    1    0    0    0    0    1    2    3
+Rock             =     5    4    2    0   -1   -1    1    3    4    4
+Pop              =    -1    0    2    3    4    3    1    0   -1   -1
+Jazz             =     3    2    1    2   -1   -1    0    1    2    3
+Electronic       =     5    4    1    0   -2    1    0    1    4    5
+Hip-Hop          =     5    5    3    1   -1   -1    1    0    2    3
+Acoustic         =     3    3    2    1    1    1    2    2    2    1
+Vocal            =    -3   -2   -1    1    3    4    4    3    1    0
+Speech           =    -6   -4   -2    0    2    4    4    3    0   -2
+Movie            =     4    4    2    0    0    1    2    2    3    2
+Gaming           =    -2   -1    0    0    1    3    5    5    3    1
+Night            =    -6   -4   -2    0    0    0   -1   -2   -2   -3
+Small Speakers   =     0    4    5    3    0    0    1    2    2    0
