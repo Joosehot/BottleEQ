@@ -1,6 +1,7 @@
-//! The window (steps 3 to 5): a small one that stays on top, with ONE graph from 20 Hz to 20 kHz:
-//! the live spectrum of what the target is given (green, its level on the right-hand scale), and over
-//! it the equalizer's curve (amber, its gain on the left-hand scale) with its handles to drag.
+//! The window (steps 3 to 5): a small one that stays on top, with ONE graph from 20 Hz to 20 kHz on
+//! ONE scale of dB: the equalizer's curve (amber) with its handles to drag, and on it the sound now
+//! (green): the live spectrum of what the target is given, against its own average level, so sound that
+//! is flat lies on the 0 dB line, and flat sound through the equalizer lies on the curve.
 //!
 //! - **The small squares** are the ten bands: drag one up or down for that band's gain. A mode sets them.
 //! - **The round points** are free, as in FL Studio's EQ: drag one sideways for its frequency, up and
@@ -24,11 +25,14 @@ use crate::ring::Ring;
 use crate::spectrum::{Spectrum, SIZE};
 use crate::wasapi::{self, run, Output, Running};
 
-/// the graph's edges: frequencies, the curve's dB each way, the spectrum's lowest level
+/// the graph's edges: frequencies, and dB each way
 const LOW: f32 = 20.0;
 const HIGH: f32 = 20000.0;
 const SPAN: f32 = 18.0;
-const DEEP: f32 = -72.0;
+/// the live line: how long it takes to follow the sound, in seconds, and below what level (dB) there
+/// is no sound to draw
+const FOLLOW: f32 = 0.5;
+const QUIET: f32 = -80.0;
 /// how near a point the pointer takes hold of it, in screen points
 const REACH: f32 = 14.0;
 /// a spike's width
@@ -141,6 +145,8 @@ struct Window {
     /// the sound the target is given (one channel), from the audio thread
     ring: Arc<Ring>,
     spectrum: Spectrum,
+    /// the live line: the sound's level at each step across the graph, following slowly
+    live: Vec<f32>,
     modes: Vec<Mode>,
     /// the mode the bands were set from; empty when they were moved by hand
     mode: String,
@@ -312,7 +318,7 @@ impl Window {
     fn graph(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         // room around the graph for the scales: gain on the left, level on the right, frequency below
-        let graph = Rect::from_min_max(response.rect.min + egui::vec2(46.0, 20.0), response.rect.max - egui::vec2(40.0, 34.0));
+        let graph = Rect::from_min_max(response.rect.min + egui::vec2(46.0, 20.0), response.rect.max - egui::vec2(14.0, 34.0));
         self.graph = graph;
         painter.rect_filled(graph, 2.0, Color32::from_gray(18));
         let (faint, small, grey) = (Stroke::new(1.0, Color32::from_gray(44)), FontId::proportional(11.0), Color32::from_gray(150));
@@ -330,13 +336,8 @@ impl Window {
             }
             painter.text(pos2(graph.left() - 6.0, y), egui::Align2::RIGHT_CENTER, if db == 0.0 { "0".to_string() } else { format!("{db:+.0}") }, small.clone(), AMBER);
         }
-        painter.text(pos2(response.rect.left() + 2.0, graph.top() - 18.0), egui::Align2::LEFT_TOP, "EQ (dB): above 0 louder, below quieter", small.clone(), AMBER);
-        // right: the spectrum's level, in the spectrum's colour
-        for level in [0.0, -24.0, -48.0, -72.0f32] {
-            let y = graph.bottom() - (level - DEEP) / -DEEP * graph.height();
-            painter.text(pos2(graph.right() + 6.0, y), egui::Align2::LEFT_CENTER, format!("{level:.0}"), small.clone(), GREEN);
-        }
-        painter.text(pos2(response.rect.right() - 2.0, graph.top() - 18.0), egui::Align2::RIGHT_TOP, "the sound now (dB)", small.clone(), GREEN);
+        painter.text(pos2(response.rect.left() + 2.0, graph.top() - 18.0), egui::Align2::LEFT_TOP, "EQ curve (dB): above 0 louder, below quieter", small.clone(), AMBER);
+        painter.text(pos2(response.rect.right() - 2.0, graph.top() - 18.0), egui::Align2::RIGHT_TOP, "the sound now: on the 0 line it is flat", small.clone(), GREEN);
         let painter = painter.with_clip_rect(graph);
         // what the frequencies are, in words
         for (from, to, name) in [(20.0, 60.0, "sub bass"), (60.0, 250.0, "bass"), (250.0, 2000.0, "mids"), (2000.0, 6000.0, "upper mids"), (6000.0, 20000.0, "treble")] {
@@ -347,21 +348,29 @@ impl Window {
             painter.text(pos2((left + right) / 2.0, graph.top() + 3.0), egui::Align2::CENTER_TOP, name, small.clone(), Color32::from_gray(170));
         }
 
-        // the sound now: at each two points across, the level of the sixth of an octave around that
-        // frequency, so it is one smooth line (level for sound with as much power in every octave)
+        // the sound now, on the curve's own scale: at each two points across, the level of the third of
+        // an octave around that frequency, against the sound's own average level. Sound with as much
+        // power in every octave (pink noise; most music roughly) lies on the 0 dB line: flat. Where it
+        // is above the line there is more of that frequency, below less; and since it is the sound after
+        // the equalizer, flat sound through a curve lies on the curve.
         let rate = self.rate() as f32;
-        let sixth = 2f32.powf(1.0 / 12.0);
+        let third = 2f32.powf(1.0 / 6.0);
         let steps = (graph.width() / 2.0) as usize;
-        let mut line = Vec::with_capacity(steps + 1);
-        for step in 0..=steps {
-            let x = graph.left() + step as f32 * 2.0;
-            let hz = hz_at(graph, x);
-            let level = self.spectrum.band(hz / sixth, hz * sixth, rate);
-            let y = graph.bottom() - ((level - DEEP) / -DEEP).clamp(0.0, 1.0) * graph.height();
-            painter.line_segment([pos2(x, graph.bottom()), pos2(x, y)], Stroke::new(2.0, GREEN.gamma_multiply(0.28)));
-            line.push(pos2(x, y));
+        let now: Vec<f32> = (0..=steps)
+            .map(|step| {
+                let hz = hz_at(graph, graph.left() + step as f32 * 2.0);
+                self.spectrum.band(hz / third, hz * third, rate)
+            })
+            .collect();
+        if self.live.len() != now.len() {
+            self.live = now.clone();
         }
-        painter.line(line, Stroke::new(2.0, GREEN));
+        let part = 1.0 - (-ui.input(|i| i.stable_dt).min(0.1) / FOLLOW).exp();
+        self.live.iter_mut().zip(&now).for_each(|(live, now)| *live += (now - *live) * part);
+        // its average level, over 40 Hz to 16 kHz
+        let heard: Vec<f32> = (0..=steps).filter(|step| (40.0..16000.0).contains(&hz_at(graph, graph.left() + *step as f32 * 2.0))).map(|step| self.live[step]).collect();
+        let average = heard.iter().sum::<f32>() / heard.len().max(1) as f32;
+        let live: Vec<Pos2> = if average > QUIET { (0..=steps).map(|step| pos2(graph.left() + step as f32 * 2.0, y_of(graph, self.live[step] - average))).collect() } else { Vec::new() };
 
         // the pointer and the handles
         let curve = self.settings.get();
@@ -447,6 +456,7 @@ impl Window {
             painter.line_segment([pos2(at.x, zero), *at], Stroke::new(2.0, colour.gamma_multiply(0.22)));
         }
         painter.line(drawn, Stroke::new(2.5, colour));
+        painter.line(live, Stroke::new(2.0, GREEN));
         let lit = |hold: Hold| self.held == Some(hold) || (self.held.is_none() && under == Some(hold));
         let label = |at: Pos2, text: String| {
             let (side, x) = if at.x > graph.center().x { (egui::Align2::RIGHT_BOTTOM, at.x - 10.0) } else { (egui::Align2::LEFT_BOTTOM, at.x + 10.0) };
@@ -613,6 +623,7 @@ pub fn open(start: Start) -> Result<(), String> {
         running: None,
         ring: Arc::new(Ring::new(4 * SIZE)),
         spectrum: Spectrum::new(),
+        live: Vec::new(),
         modes: eq::modes()?,
         mode,
         on_top: true,
