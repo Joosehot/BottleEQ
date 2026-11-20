@@ -60,3 +60,31 @@ monitor: not yet explained (the devices' own volume settings would do it; not ch
 
 The first version of the clock correction followed the ring's fill from callback to callback and made
 the pitch wander (the tone was only 84% at 1 kHz); it now follows the fill's one-second average.
+
+## Getting under 10 ms (measured 2026-11-20, not built yet)
+
+The 44 ms of step 1 is three blocks: loopback arrives in 10 ms blocks, the cushion is 25 ms, playback
+goes out in 10 ms blocks. cpal can do no better. What Windows allows on this machine
+(`cargo run --release --example periods`):
+
+| device | shared mode, least block | exclusive mode, least block |
+|---|---|---|
+| S/PDIF | 2.67 ms (128 frames) | 2.67 ms |
+| USB speakers | 10 ms | 3 ms |
+| monitor | 10 ms | 3 ms |
+
+Tried without a sound (`cargo run --release --example lowlat -- "S/PDIF" "U27G3X"`):
+
+- A silent stream that asks the S/PDIF engine for its least period (IAudioClient3) makes loopback
+  arrive in 128-frame blocks: 751 blocks in 2 s, longest wait 2.81 ms (201 blocks of 480, longest wait
+  10.1 ms, without it).
+- The monitor opens in exclusive mode, 16-bit, with a 160-frame buffer (3.33 ms); 3.00 ms is not a
+  whole block for it. 24- and 32-bit are not supported there. The USB speakers were not tried:
+  exclusive mode takes the device from everything else that is playing to it.
+
+So the path under 10 ms is: loopback at 2.67 ms + a cushion of about 3 ms + exclusive playback at about
+3.3 ms, on WASAPI directly (the `windows` crate) instead of cpal. On paper 9 to 12 ms; to be measured.
+
+From the toolkit: Vuuvee (`Desktop/Projektit/Vuuvee`) has its own biquad, EQ, matching EQ, FFT,
+resampler and declicker (`src/dsp/`) for steps 2 to 4, and a live path on cpal at about 30 ms.
+StrikeUFP pins threads to cores (`gpu/src/remote/win.rs`).
