@@ -7,7 +7,7 @@
 //! A device is its number in `devices` or a part of its name. Options:
 //!   --exclusive | --shared   take the target for Bottle EQ alone (short delay) or share it (long delay);
 //!                            without either, `run` asks
-//!   --cushion-ms <n>         sound kept in the ring on top of what the devices' blocks need (default 3)
+//!   --cushion-ms <n>         sound kept queued on top of what the devices' blocks need (default 2)
 //!   --seconds <n>            run: stop by itself; selftest: the tone's length
 //!
 //! Step 1 of 5: the stream flows, nothing is done to it yet.
@@ -72,22 +72,13 @@ impl Heard {
     }
 }
 
-/// The delay Bottle EQ adds, in milliseconds, (mean, longest), since the last look: the wait from a
-/// frame arriving from the source's engine to its being handed to the target, plus the target's block
-/// (in exclusive mode a buffer handed over begins to play when the one before it ends).
-fn delay(running: &Running) -> (f32, f32) {
-    let (mean, longest) = running.waited();
-    let block = running.opened.out_block as f32 * 1000.0 / running.out_rate as f32;
-    (mean + block, longest + block)
-}
-
 fn describe(running: &Running, source: &Output, target: &Output) {
     let o = &running.opened;
     println!("capturing what plays to: {}  (in blocks of {} frames, {:.2} ms)", source.name, o.in_block, o.in_block as f32 * 1000.0 / running.in_rate as f32);
     println!(
         "playing it to:           {}  ({}, blocks of {} frames, {:.2} ms, {})",
         target.name,
-        if o.exclusive { "exclusive mode" } else { "shared mode" },
+        if o.direct { "exclusive mode, each block played as it arrives" } else if o.exclusive { "exclusive mode" } else { "shared mode" },
         o.out_block,
         o.out_block as f32 * 1000.0 / running.out_rate as f32,
         if o.exclusive { format!("{}-bit", o.out_bits) } else { "32-bit float".to_string() }
@@ -96,7 +87,7 @@ fn describe(running: &Running, source: &Output, target: &Output) {
         println!("exclusive mode was not to be had: {}", o.note);
     }
     let with = running.meters.priority.load(Ordering::Relaxed);
-    println!("audio threads with Windows' Pro Audio priority: {with} of 2");
+    println!("audio threads with Windows' Pro Audio priority: {}", if with == 2 { "yes" } else { "NO" });
 }
 
 fn main() {
@@ -107,7 +98,7 @@ fn main() {
         (i < args.len()).then(|| args.remove(i))
     };
     let (from, to) = (take("--from"), take("--to"));
-    let cushion_ms: f32 = take("--cushion-ms").map(|s| s.parse().unwrap_or_else(|_| fail("--cushion-ms takes a number"))).unwrap_or(3.0);
+    let cushion_ms: f32 = take("--cushion-ms").map(|s| s.parse().unwrap_or_else(|_| fail("--cushion-ms takes a number"))).unwrap_or(2.0);
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
     let mut flag = |f: &str| match args.iter().position(|a| a == f) {
         Some(i) => {
@@ -143,7 +134,7 @@ fn main() {
             // the app asks for exclusive mode: from the one who runs it first, then from Windows
             let take_it = exclusive || (!shared && {
                 print!(
-                    "Bottle EQ wants \"{}\" for itself (exclusive mode): the delay is then about 12 ms instead of 44.\nNothing else can play to that device while Bottle EQ runs. Take it? [Y/n] ",
+                    "Bottle EQ wants \"{}\" for itself (exclusive mode): the delay is then about 6 ms instead of 44.\nNothing else can play to that device while Bottle EQ runs. Take it? [Y/n] ",
                     target.name
                 );
                 let _ = std::io::stdout().flush();
@@ -164,7 +155,7 @@ fn main() {
             let m = &running.meters;
             while !stop.load(Ordering::Relaxed) && seconds.is_none_or(|s| began.elapsed().as_secs_f32() < s) {
                 std::thread::sleep(Duration::from_secs(1));
-                let (mean, longest) = delay(&running);
+                let (mean, longest) = running.delay();
                 println!(
                     "in {} dB  out {} dB  delay {:4.1} ms (longest {:4.1})  ring {:4.1} ms  reading {:+5.0} ppm  dry {}  dropped {}  late {}",
                     db(value(&m.peak_in)),
@@ -197,9 +188,9 @@ fn main() {
             // the tone: 1 kHz at -40 dB, played to the source like any program would
             println!("a quiet 1 kHz tone (-40 dB, {length} s) is played to the source ...");
             let tone = wasapi::tone(&source, HZ, 0.01, length);
-            let _ = running.waited();
+            let _ = running.delay();
             std::thread::sleep(Duration::from_secs_f64(length + 0.3));
-            let (mean, longest) = delay(&running);
+            let (mean, longest) = running.delay();
             let _ = tone.join();
             std::thread::sleep(Duration::from_millis(500));
 
@@ -213,7 +204,13 @@ fn main() {
                 true => println!("handed to the target:   {} dB, {:.0}% of the sound is 1 kHz", db((2.0 * h.first / (rate / 2.0)).sqrt() as f32), 100.0 * share),
                 false => println!("handed to the target:   nothing"),
             }
-            println!("loudest jump between two frames: {:.5} as captured, {:.5} as handed to the target (the tone alone: {smooth:.5})", value(&m.jump_in), h.jump);
+            println!(
+                "loudest jump between two frames: {:.5} as captured ({:.2} s into the capture; the tone ran {:.1} s), {:.5} as handed to the target (the tone alone: {smooth:.5})",
+                value(&m.jump_in),
+                m.jump_at.load(Ordering::Relaxed) as f64 / running.in_rate as f64,
+                length,
+                h.jump
+            );
             println!(
                 "ring: {} frames captured, {} played, {} dropped, ran dry {} times, woken late {} times, {} breaks in what was captured, read {:+.0} ppm off nominal at the end",
                 m.captured.load(Ordering::Relaxed),
@@ -225,7 +222,13 @@ fn main() {
                 value(&m.drift_ppm)
             );
             println!("delay while the tone played: {mean:.1} ms on average, {longest:.1} ms at the longest (from the source's engine handing the sound over to the target beginning to play it)");
-            let ok = h.began && share > 0.9 && h.jump < 1.5 * smooth && m.dry.load(Ordering::Relaxed) == 0 && m.dropped.load(Ordering::Relaxed) == 0 && m.late.load(Ordering::Relaxed) == 0;
+            // the path is judged by what it adds: a jump that was already in the captured sound is the
+            // source's (or this test's tone's), and is said, not failed
+            let captured = value(&m.jump_in) as f64;
+            if captured > 1.5 * smooth {
+                println!("NOTE: the captured sound itself had a jump; the path passed it on as it came");
+            }
+            let ok = h.began && share > 0.9 && h.jump < (1.5 * smooth).max(1.1 * captured) && m.dry.load(Ordering::Relaxed) == 0 && m.dropped.load(Ordering::Relaxed) == 0 && m.late.load(Ordering::Relaxed) == 0;
             println!("{}", if ok { "PASS" } else { "FAIL" });
             if !ok {
                 std::process::exit(1);

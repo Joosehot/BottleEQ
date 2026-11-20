@@ -34,9 +34,11 @@ device. Five things follow:
 5. **Exclusive mode cannot be listened to by loopback**, so the delay is measured on the clock: from a
    block arriving from the source's engine to its frames beginning to play at the target.
 
-The path is: capture thread -> lock-free ring -> playback thread (`src/wasapi.rs`, `src/ring.rs`), on
-WASAPI directly through the `windows` crate. Both threads have Windows' "Pro Audio" priority, wake on
-the device's own event, and never lock or allocate.
+In exclusive mode the path is one thread (`direct` in `src/wasapi.rs`): wait for a block from the
+source, read it at the target's rate, process it, write it into the target's buffer. In shared mode it
+is capture thread -> lock-free ring -> playback thread. The audio threads have Windows' "Pro Audio"
+priority, wake on the device's own event, and never lock or allocate. All of it is on WASAPI directly,
+through the `windows` crate.
 
 ## Use
 
@@ -47,43 +49,50 @@ bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through th
 ```
 
 A device is its number in `devices` or a part of its name. `--cushion-ms <n>` is the sound kept in the
-ring on top of what the two devices' blocks need (default 3). To use it: make the source the Windows
+target's buffer on top of what the two devices' blocks need (default 2). To use it: make the source the Windows
 default output device, then `run`.
 
 ## Measured (2026-11-20, this machine)
 
 `selftest` plays a 1 kHz tone at -40 dB to S/PDIF like any program would, and looks at what is captured
 and at what is handed to the target: how much of it is the tone, the loudest jump between two frames (a
-click shows there), whether the ring ran dry, and the delay.
+click shows there), whether the device ran out of sound, and the delay Bottle EQ adds (from a block
+arriving from the source's engine to its beginning to play).
 
-To the USB speakers, exclusive mode, 16-bit, blocks of 144 frames (3 ms):
+To the USB speakers, exclusive mode, 16-bit, periods of 144 frames (3 ms):
 
-| cushion | tone | delay, mean | longest | ran dry | clean |
-|---|---|---|---|---|---|
-| 3 ms | 20 s | 11.9 ms | 17.6 ms | 0 | yes |
-| 2 ms | 20 s | 10.9 ms | 16.8 ms | 0 | yes |
-| 1 ms | 20 s | 9.5 ms | 14.1 ms | 0 | yes |
-| 1 ms | 60 s | 8.4 ms | 13.6 ms | 0 | no: one jump |
-| 1 ms | 60 s | 8.2 ms | 15.7 ms | 16 | no: clicks |
+| path | cushion | tone | delay, mean | longest | ran out | clean |
+|---|---|---|---|---|---|---|
+| cpal, shared mode (the first version) | 25 ms | 1.5 s | 44 ms | | 0 | yes |
+| two threads and a ring | 3 ms | 20 s | 11.9 ms | 17.6 ms | 0 | yes |
+| two threads and a ring | 1 ms | 60 s | 8.2 ms | 15.7 ms | 16 | no: clicks |
+| **direct** | 3 ms | 5 s | 9.1 ms | 11.4 ms | 0 | yes |
+| **direct** | 2 ms (default) | 30 s | 6.0 ms | 12.7 ms | 0 | yes |
+| **direct** | 1 ms | 30 s | 4.8 ms | 9.7 ms | 0 | yes |
+| **direct** | 1 ms | 60 s | 4.6 ms | 9.9 ms | 0 | yes |
+| **direct** | 1 ms | 20 s, three runs | | | 0 | yes |
 
-So under 10 ms is reached but not cleanly: at a 1 ms cushion the ring sometimes runs dry. The default
-cushion is 3 ms: 11.9 ms, clean in these runs (down from 44 ms with cpal). The longest delays are from
-the first seconds, while the clocks' difference is still being learned.
+The direct path (the default in exclusive mode): one thread; each block is read at the target's rate,
+processed and written into the target's buffer as it arrives from the source, behind what is already
+queued. With two threads the ring had to hold a whole block of the target's before every read, because
+the two threads woke on two unrelated clocks; that block is what was saved. The longest delays are from
+the first seconds, while the two clocks' difference is still being learned. Shared mode still goes
+through the ring and two threads.
 
-To the monitor's output (it has no speakers; a comparison only): 8.1 ms mean, 9.8 ms longest over 30 s,
-clean while the tone played.
+Not explained: in 2 runs of 10 the *captured* sound itself had one jump (0.00792 both times, where the
+tone alone moves 0.0013 a frame), with no break reported by Windows; the path passed it on as it came.
+It is either this test's tone or the source's engine at its short period. `selftest` says so when it
+sees it.
+
+Not done: nobody has listened yet. Every number here is from the samples, not from ears.
 
 What the devices allow (`cargo run --release --example periods`): S/PDIF shared blocks down to 2.67 ms;
-the USB speakers 10 ms shared, 3 ms exclusive.
-
-Why 12 ms and not less: the two threads wake on two unrelated clocks, so the ring must hold a whole
-target block (3 ms) plus half a source block (1.3 ms) plus the cushion before each read, and then the
-target's block (3 ms) comes on top. Not yet built: playing straight from the capture thread, each block
-as it arrives, which takes the target's block out of the ring.
+the USB speakers 10 ms shared, 3 ms exclusive. The monitor's output has no speakers.
 
 Wrong turns, for the record: the time stamp WASAPI gives with a loopback block is not the moment it was
 mixed (measured against it the delay came out as 4 ms); the ring kept what had gathered while the
-target was being opened (14 ms); the test's own tone was cut mid-wave at its end and read as a click.
+target was being opened (14 ms); the test's own tone was cut mid-wave at its end and read as a click; a
+counter that hid one "ran dry" hid sixteen.
 
 From the toolkit: Vuuvee (`Desktop/Projektit/Vuuvee`) has its own biquad, EQ, matching EQ, FFT,
 resampler and declicker (`src/dsp/`) for steps 2 to 4, and a live path on cpal at about 30 ms.

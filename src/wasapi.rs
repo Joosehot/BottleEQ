@@ -72,8 +72,10 @@ pub struct Meters {
     pub late: AtomicU64,
     /// times Windows said a captured block does not follow the one before (sound was lost on the way in)
     pub breaks: AtomicU64,
-    /// the loudest jump from one frame to the next in what was captured (first channel)
+    /// the loudest jump from one frame to the next in what was captured (first channel), and how many
+    /// frames had been captured when it came
     pub jump_in: AtomicU32,
+    pub jump_at: AtomicU64,
     /// audio threads that Windows gave its "Pro Audio" priority (2 when both have it)
     pub priority: AtomicU64,
     /// when (in 100 ns of the performance counter) the latest captured block arrived, and how many
@@ -263,6 +265,9 @@ pub struct Opened {
     pub out_bits: u16,
     /// why exclusive mode was not used, when it was asked for
     pub note: String,
+    /// each captured block is played as it arrives, from the capture thread itself (no ring between two
+    /// threads)
+    pub direct: bool,
 }
 
 /// The running path: it lives as long as this is kept.
@@ -276,12 +281,19 @@ pub struct Running {
 }
 
 impl Running {
-    /// The mean and the longest wait in milliseconds since the last look, between a frame arriving from
-    /// the source's engine and being handed to the target. The target's own buffer comes on top (`out_block`).
-    pub fn waited(&self) -> (f32, f32) {
+    /// The delay Bottle EQ adds, in milliseconds, (mean, longest), since the last look: from a frame
+    /// arriving from the source's engine to its beginning to play at the target.
+    ///
+    /// Through the ring: the wait until the frame is handed over, plus one block of the target's (a
+    /// buffer handed over at an event begins to play when the one before it ends).
+    /// Direct: the sound queued ahead of the frame in the target's buffer, plus the wait for the device's
+    /// next period to begin, which is anything from nothing to one block: half a block in the mean.
+    pub fn delay(&self) -> (f32, f32) {
         let m = &self.meters;
         let (sum, n, longest) = (m.wait_sum.swap(0, Ordering::Relaxed), m.wait_count.swap(0, Ordering::Relaxed), m.wait_longest.swap(0, Ordering::Relaxed));
-        (sum as f32 / n.max(1) as f32 / 1000.0, longest as f32 / 1000.0)
+        let (mean, longest) = (sum as f32 / n.max(1) as f32 / 1000.0, longest as f32 / 1000.0);
+        let block = self.opened.out_block as f32 * 1000.0 / self.out_rate as f32;
+        if self.opened.direct { (mean + block / 2.0, longest + block) } else { (mean + block, longest + block) }
     }
 }
 
@@ -386,8 +398,9 @@ fn pcm(rate: u32, channels: usize, bits: u16, valid: u16) -> WAVEFORMATEXTENSIBL
 }
 
 /// The target in exclusive mode at its least period: the client, (container bits, valid bits) and the
-/// buffer's frames.
-unsafe fn exclusive(dev: &IMMDevice, target: &Output) -> Result<(IAudioClient, (u16, u16), u32), String> {
+/// period's frames. `pushed`: no event; the buffer is three periods long and is written into whenever
+/// there is sound (else one buffer of one period is filled at each event).
+unsafe fn exclusive(dev: &IMMDevice, target: &Output, pushed: bool) -> Result<(IAudioClient, (u16, u16), u32), String> {
     let probe: IAudioClient = dev.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
     let (mut shared, mut least) = (0i64, 0i64);
     probe.GetDevicePeriod(Some(&mut shared), Some(&mut least)).map_err(|e| e.to_string())?;
@@ -407,6 +420,17 @@ unsafe fn exclusive(dev: &IMMDevice, target: &Output) -> Result<(IAudioClient, (
             client = dev.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
             opened = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, period, format, None::<*const GUID>);
         }
+        if opened.is_ok() && pushed {
+            // now that the period's true length is known: the same device again, three periods long, no event
+            let frames = client.GetBufferSize().map_err(|e| e.to_string())?;
+            let period = (10_000_000.0 * frames as f64 / target.rate as f64 + 0.5) as i64;
+            drop(client);
+            client = dev.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+            opened = client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 3 * period, period, format, None::<*const GUID>);
+            if opened.is_ok() {
+                return Ok((client, (bits, valid), frames));
+            }
+        }
         match opened {
             Ok(()) => {
                 let frames = client.GetBufferSize().map_err(|e| e.to_string())?;
@@ -418,6 +442,40 @@ unsafe fn exclusive(dev: &IMMDevice, target: &Output) -> Result<(IAudioClient, (
         }
     }
     Err(why)
+}
+
+/// Float sound into the device's buffer, in the device's samples: `bits` is (container, valid), (0, _)
+/// for float as it is.
+unsafe fn hand_over(sound: &[f32], data: *mut u8, bits: (u16, u16), noise: &mut u32) {
+    match bits {
+        (0, _) => std::slice::from_raw_parts_mut(data as *mut f32, sound.len()).copy_from_slice(sound),
+        (16, _) => {
+            let out = std::slice::from_raw_parts_mut(data as *mut i16, sound.len());
+            for (o, s) in out.iter_mut().zip(sound.iter()) {
+                // 16 bits are few: a little triangular noise keeps the rounding from following the sound
+                let mut next = || {
+                    *noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (*noise >> 8) as f32 / 16_777_216.0
+                };
+                let dither = next() - next();
+                *o = (s * 32767.0 + dither).round().clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+        (24, _) => {
+            let out = std::slice::from_raw_parts_mut(data, sound.len() * 3);
+            for (o, s) in out.chunks_mut(3).zip(sound.iter()) {
+                let v = (s.clamp(-1.0, 1.0) as f64 * 8_388_607.0).round() as i32;
+                o.copy_from_slice(&v.to_le_bytes()[..3]);
+            }
+        }
+        (_, valid) => {
+            let out = std::slice::from_raw_parts_mut(data as *mut i32, sound.len());
+            let (scale, shift) = if valid == 24 { (8_388_607.0, 8) } else { (2_147_483_647.0, 0) };
+            for (o, s) in out.iter_mut().zip(sound.iter()) {
+                *o = ((s.clamp(-1.0, 1.0) as f64 * scale).round() as i32) << shift;
+            }
+        }
+    }
 }
 
 /// The playback thread: the ring, read at the target's rate, processed, and handed to the target.
@@ -435,7 +493,7 @@ unsafe fn playback(
 ) -> Win<()> {
     let dev = device(&target.id)?;
     let mut opened = Opened::default();
-    let taken = if want_exclusive { exclusive(&dev, target) } else { Err(String::new()) };
+    let taken = if want_exclusive { exclusive(&dev, target, false) } else { Err(String::new()) };
     let (client, format_bits, block) = match taken {
         Ok((client, bits, frames)) => {
             opened.exclusive = true;
@@ -497,52 +555,200 @@ unsafe fn playback(
         let peak = sound.iter().fold(0.0f32, |p, s| p.max(s.abs()));
         m.peak_out.store(bits(value(&m.peak_out).max(peak)), Ordering::Relaxed);
         let data = render.GetBuffer(frames)?;
-        match format_bits {
-            (0, _) => std::slice::from_raw_parts_mut(data as *mut f32, sound.len()).copy_from_slice(sound),
-            (16, _) => {
-                let out = std::slice::from_raw_parts_mut(data as *mut i16, sound.len());
-                for (o, s) in out.iter_mut().zip(sound.iter()) {
-                    // 16 bits are few: a little triangular noise keeps the rounding from following the sound
-                    let mut next = || {
-                        noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                        (noise >> 8) as f32 / 16_777_216.0
-                    };
-                    let dither = next() - next();
-                    *o = (s * 32767.0 + dither).round().clamp(-32768.0, 32767.0) as i16;
-                }
-            }
-            (24, _) => {
-                let out = std::slice::from_raw_parts_mut(data, sound.len() * 3);
-                for (o, s) in out.chunks_mut(3).zip(sound.iter()) {
-                    let v = (s.clamp(-1.0, 1.0) as f64 * 8_388_607.0).round() as i32;
-                    o.copy_from_slice(&v.to_le_bytes()[..3]);
-                }
-            }
-            (_, valid) => {
-                let out = std::slice::from_raw_parts_mut(data as *mut i32, sound.len());
-                let (scale, shift) = if valid == 24 { (8_388_607.0, 8) } else { (2_147_483_647.0, 0) };
-                for (o, s) in out.iter_mut().zip(sound.iter()) {
-                    *o = ((s.clamp(-1.0, 1.0) as f64 * scale).round() as i32) << shift;
-                }
-            }
-        }
+        hand_over(sound, data, format_bits, &mut noise);
         render.ReleaseBuffer(frames, 0)?;
     }
     client.Stop()?;
     Ok(())
 }
 
+/// The direct path, one thread: each block is played as it arrives from the source.
+///
+/// With two threads the ring had to hold a whole block of the target's before every read, because the
+/// two threads woke on two unrelated clocks. Here the target's buffer is three of its periods long and
+/// is not filled at its events: whenever a block comes from the source (every 2.67 ms) it is read at the
+/// target's rate, processed and written straight in behind what is already queued. What is queued is
+/// held, on average, at a little over what the device takes in one period.
+unsafe fn direct(source: &Output, target: &Output, cushion_ms: f32, process: &mut dyn FnMut(&mut [f32], usize), m: &Meters, stop: &AtomicBool, ready: &Sender<Result<Opened, String>>) -> Win<()> {
+    // the target first: if exclusive mode is not to be had, say why and leave
+    let out_dev = device(&target.id)?;
+    let (out, format_bits, period) = match exclusive(&out_dev, target, true) {
+        Ok(taken) => taken,
+        Err(why) => {
+            let _ = ready.send(Err(why));
+            return Ok(());
+        }
+    };
+    let room = out.GetBufferSize()?;
+    let render: IAudioRenderClient = out.GetService()?;
+    let out_ch = target.channels.min(2);
+
+    // the source: its engine at its least period, and its mix by loopback
+    let dev = device(&source.id)?;
+    let holder: IAudioClient3 = dev.Activate(CLSCTX_ALL, None)?;
+    let format = holder.GetMixFormat()?;
+    let mut in_block = source.periods.0;
+    if source.periods.1 > 0 && source.periods.1 < source.periods.0 && holder.InitializeSharedAudioStream(0, source.periods.1, format, None).is_ok() {
+        holder.Start()?;
+        in_block = source.periods.1;
+    }
+    let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
+    client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 2_000_000, 0, format, None)?;
+    let event = CreateEventW(None, false, false, None)?;
+    client.SetEventHandle(event)?;
+    let packets: IAudioCaptureClient = client.GetService()?;
+
+    let (in_ch, in_rate) = (source.channels, source.rate);
+    let nominal = in_rate as f64 / target.rate as f64;
+    // What should be queued, on average, when a block is about to be written: the device takes one
+    // period at a time at moments unrelated to ours, so before our write the queue has swung down by up
+    // to one period; half a period is its mean, and the cushion keeps the lowest point off the floor.
+    let cushion = (period as f64 / 2.0 + in_block as f64 / nominal / 4.0 + cushion_ms as f64 / 1000.0 * target.rate as f64) as u32;
+    if cushion + 2 * in_block > room {
+        let _ = ready.send(Err("the device's buffer is too short for the direct path".to_string()));
+        return Ok(());
+    }
+    // the first sound queued is silence, up to the cushion
+    render.GetBuffer(cushion)?;
+    render.ReleaseBuffer(cushion, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
+    out.Start()?;
+    client.Start()?;
+    let _ = ready.send(Ok(Opened { in_block, out_block: period, exclusive: true, out_bits: format_bits.1, note: String::new(), direct: true }));
+
+    // a short store of the source's frames, to read between them at the target's rate
+    let store = Ring::new(in_rate as usize / 4 * in_ch);
+    let silence = vec![0.0f32; 4096 * in_ch];
+    let mut sound = vec![0.0f32; room as usize * out_ch];
+    let (mut phase, mut usual, mut lean, mut last, mut noise) = (0.0f64, cushion as f64, 0.0f64, 0.0f32, 0x2545_F491u32);
+    while !stop.load(Ordering::Relaxed) {
+        if WaitForSingleObject(event, 100) != WAIT_OBJECT_0 {
+            continue;
+        }
+        while packets.GetNextPacketSize()? > 0 {
+            let (mut data, mut n, mut flags) = (std::ptr::null_mut(), 0u32, 0u32);
+            packets.GetBuffer(&mut data, &mut n, &mut flags, None, None)?;
+            if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && m.captured.load(Ordering::Relaxed) > 0 {
+                m.breaks.fetch_add(1, Ordering::Relaxed);
+            }
+            let samples: &[f32] = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 { &silence[..(n as usize * in_ch).min(silence.len())] } else { std::slice::from_raw_parts(data as *const f32, n as usize * in_ch) };
+            let fitted = store.push(samples) / in_ch;
+            m.captured.fetch_add(fitted as u64, Ordering::Relaxed);
+            let (mut peak, mut jump) = (value(&m.peak_in), value(&m.jump_in));
+            for (i, frame) in samples.chunks(in_ch).enumerate() {
+                peak = frame.iter().fold(peak, |p, s| p.max(s.abs()));
+                if (frame[0] - last).abs() > jump {
+                    jump = (frame[0] - last).abs();
+                    m.jump_at.store(m.captured.load(Ordering::Relaxed) - fitted as u64 + i as u64, Ordering::Relaxed);
+                }
+                last = frame[0];
+            }
+            m.peak_in.store(bits(peak), Ordering::Relaxed);
+            m.jump_in.store(bits(jump), Ordering::Relaxed);
+            packets.ReleaseBuffer(n)?;
+
+            // how much is queued at the target right now
+            let mut queued = out.GetCurrentPadding()?;
+            if queued == 0 {
+                // the device ran out: there is a gap in the sound. Begin again from the cushion.
+                m.dry.fetch_add(1, Ordering::Relaxed);
+                render.GetBuffer(cushion)?;
+                render.ReleaseBuffer(cushion, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
+                (queued, usual) = (cushion, cushion as f64);
+            }
+            m.fill.store(queued as u64, Ordering::Relaxed);
+            // the queue's slow average is held at the cushion by reading the source a hair fast or slow, and
+            // the lasting difference of the two clocks is learned as `lean`
+            usual += 0.002 * (queued as f64 - usual);
+            let off = (usual - cushion as f64) / target.rate as f64;
+            lean = (lean + off * 0.000_02).clamp(-0.0005, 0.0005);
+            let speed = (off / 10.0 + lean).clamp(-0.001, 0.001);
+            m.drift_ppm.store(bits((speed * 1e6) as f32), Ordering::Relaxed);
+            let step = nominal * (1.0 + speed);
+
+            // read everything that has come, at the target's rate
+            let mut frames = 0usize;
+            while store.len() / in_ch >= 4 && frames < (room - queued) as usize {
+                let frame = &mut sound[frames * out_ch..(frames + 1) * out_ch];
+                for (c, s) in frame.iter_mut().enumerate() {
+                    let from = if c < in_ch { c } else { 0 };
+                    *s = hermite(store.peek(from), store.peek(in_ch + from), store.peek(2 * in_ch + from), store.peek(3 * in_ch + from), phase as f32);
+                }
+                phase += step;
+                let whole = phase as usize;
+                store.skip(whole.min(store.len() / in_ch) * in_ch);
+                phase -= whole as f64;
+                frames += 1;
+            }
+            // what did not fit (the queue is full: we are far ahead of the device) is let go
+            let left = store.len() / in_ch;
+            if left > 8 {
+                store.skip((left - 3) * in_ch);
+                m.dropped.fetch_add((left - 3) as u64, Ordering::Relaxed);
+            }
+            if frames == 0 {
+                continue;
+            }
+            let block = &mut sound[..frames * out_ch];
+            process(block, out_ch);
+            let peak = block.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+            m.peak_out.store(bits(value(&m.peak_out).max(peak)), Ordering::Relaxed);
+            let data = render.GetBuffer(frames as u32)?;
+            hand_over(block, data, format_bits, &mut noise);
+            render.ReleaseBuffer(frames as u32, 0)?;
+            m.played.fetch_add(frames as u64, Ordering::Relaxed);
+            // the first of these frames plays when what was queued ahead of it has been played
+            let waits = queued as u64 * 1_000_000 / target.rate as u64;
+            m.wait_sum.fetch_add(waits, Ordering::Relaxed);
+            m.wait_count.fetch_add(1, Ordering::Relaxed);
+            m.wait_longest.fetch_max(waits, Ordering::Relaxed);
+        }
+    }
+    client.Stop()?;
+    let _ = holder.Stop();
+    out.Stop()?;
+    Ok(())
+}
+
 /// Capture the source's mix by loopback and play it to the target. `cushion_ms` is the sound kept in
 /// the ring on top of what the two devices' blocks need. `process` is called in the playback thread on
 /// every block of interleaved output frames just before it is played.
-pub fn run(source: &Output, target: &Output, cushion_ms: f32, want_exclusive: bool, mut process: impl FnMut(&mut [f32], usize) + Send + 'static) -> Result<Running, String> {
+pub fn run(source: &Output, target: &Output, cushion_ms: f32, want_exclusive: bool, process: impl FnMut(&mut [f32], usize) + Send + 'static) -> Result<Running, String> {
     if source.id == target.id {
         return Err("the source and the target are the same device: loopback is a copy of what that device plays, so playing it back there would double it and feed it round again".to_string());
     }
-    let ring = Arc::new(Ring::new(source.rate as usize * source.channels)); // one second
     let meters = Arc::new(Meters::default());
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
+    // `process` goes to whichever thread plays
+    let process = Arc::new(std::sync::Mutex::new(process));
+    let mut why_not = String::new();
+
+    if want_exclusive {
+        let (said, heard) = channel::<Result<Opened, String>>();
+        let (src, tgt, m, s, pr) = (source.clone(), target.clone(), meters.clone(), stop.clone(), process.clone());
+        let thread = std::thread::spawn(move || unsafe {
+            m.priority.fetch_add(2 * pro_audio() as u64, Ordering::Relaxed);
+            // this thread alone uses `process` from here on: the lock is taken once and kept
+            let mut process = pr.lock().unwrap();
+            if let Err(e) = direct(&src, &tgt, cushion_ms, &mut *process, &m, &s, &said) {
+                let _ = said.send(Err(e.to_string()));
+                eprintln!("the audio thread stopped: {e}");
+            }
+        });
+        match heard.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(opened)) => {
+                threads.push(thread);
+                return Ok(Running { stop, threads, meters, opened, in_rate: source.rate, out_rate: target.rate });
+            }
+            Ok(Err(why)) => {
+                let _ = thread.join();
+                meters.priority.store(0, Ordering::Relaxed);
+                why_not = why;
+            }
+            Err(_) => return Err("the audio thread did not start".to_string()),
+        }
+    }
+    let ring = Arc::new(Ring::new(source.rate as usize * source.channels)); // one second
 
     let (said, heard) = channel::<Result<u32, String>>();
     let (src, r, m, s) = (source.clone(), ring.clone(), meters.clone(), stop.clone());
@@ -578,7 +784,8 @@ pub fn run(source: &Output, target: &Output, cushion_ms: f32, want_exclusive: bo
     };
     threads.push(std::thread::spawn(move || unsafe {
         m.priority.fetch_add(pro_audio() as u64, Ordering::Relaxed);
-        if let Err(e) = playback(&tgt, reader, want_exclusive, in_block, cushion_ms, &mut process, &m, &s, &said) {
+        let mut process = process.lock().unwrap();
+        if let Err(e) = playback(&tgt, reader, false, in_block, cushion_ms, &mut *process, &m, &s, &said) {
             let _ = said.send(Err(format!("playback on {}: {e}", tgt.name)));
             eprintln!("playback stopped: {e}");
         }
@@ -589,6 +796,7 @@ pub fn run(source: &Output, target: &Output, cushion_ms: f32, want_exclusive: bo
         Err(_) => return Err("the playback thread did not start".to_string()),
     };
     opened.in_block = in_block;
+    opened.note = why_not;
     Ok(Running { stop, threads, meters, opened, in_rate: source.rate, out_rate: target.rate })
 }
 
