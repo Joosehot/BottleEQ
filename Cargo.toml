@@ -1,0 +1,12 @@
+[package]
+name = "bottle-eq"
+version = "0.1.0"
+edition = "2021"
+description = "Bottle EQ: a system-wide audio equalizer for Windows with a live visualizer"
+publish = false
+
+[dependencies]
+cpal = "0.15"
+
+[profile.release]
+debug = false
