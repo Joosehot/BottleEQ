@@ -102,16 +102,21 @@ python tools/spectra.py test/out/captured.wav test/out/handed.wav   # band again
 - **Played -> captured** (the source side): the same sound, wave for wave (alike 1.00000 in every 43 ms
   window but the first, where the comparison had not yet found its place), 0.78 dB lower: the S/PDIF
   device's own volume setting, most likely.
-- **Captured -> given to the speakers** (Bottle EQ itself), level by octave band over the whole piece:
+- **Captured -> given to the speakers** (Bottle EQ itself, with nothing switched on: there is no
+  equalizer yet, so flat is what it should be), level by octave band over the whole piece:
 
   | band (Hz) | 31.5 | 63 | 125 | 250 | 500 | 1k | 2k | 4k | 8k | 16k |
   |---|---|---|---|---|---|---|---|---|---|---|
-  | dB | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | -0.01 | -0.12 | -0.78 |
+  | 4-point read (first) | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | -0.01 | -0.12 | -0.78 |
+  | windowed sinc (now) | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | +0.01 |
 
-  Flat to 4 kHz; the top octave loses 0.8 dB. That is the 4-point read between the samples (the two
-  clocks); a longer one (Vuuvee has a resampler) would give it back. Window by window (937 of 85 ms) no
-  band differs by more than 6 dB, 4 windows differ by 3 to 6 dB (all in the first 6 s, where the two
-  files are least well lined up): no click or gap shows.
+  And through the piece, in stretches of 5 s: the 16 kHz band was -0.68 to -0.90 dB with the 4-point
+  read (and from one 85 ms window to the next anything from +0.06 to -2.06 dB, as the two clocks slid
+  past each other); with the sinc it is 0.00 to +0.03 dB in every stretch. Window by window (937) the
+  biggest difference in any band is 0.04 dB in the median (was 0.53), 1 window differs by more than
+  3 dB (at 0.73 s, where the two files are least well lined up), none by 6 dB: no click or gap shows.
+- The sinc reads 16 frames behind the newest sound (0.33 ms), which is counted in the delay: 5.8 ms on
+  average, 9.9 ms at the longest, for this piece.
 
 Not done: nobody has listened yet, and what the speakers themselves made of it was not recorded (there
 are microphones on this machine; they were not used). `test/out/handed.wav` is what the speakers were

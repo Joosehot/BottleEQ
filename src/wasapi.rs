@@ -15,7 +15,8 @@
 //! 2. **Silence is no data.** When nothing plays to the source, loopback delivers nothing. Playback then
 //!    plays silence and waits for a cushion of sound before it starts again.
 //! 3. **Two devices, two clocks.** Their "48000 Hz" differ by a few parts in a hundred thousand, so the
-//!    ring between them is read a hair fast or slow to hold its fill at the cushion (`Reader`).
+//!    source's sound is read a hair fast or slow, between its samples (`Sinc`), to hold what is queued at
+//!    the cushion.
 //! 4. **The delay is made of blocks.** A sound waits for the source's engine period to end before it is
 //!    handed over, then in the ring, then for the target's buffer. At 10 ms periods that cannot go under
 //!    about 30 ms. So:
@@ -156,16 +157,64 @@ pub fn find(wanted: &str) -> Result<Output, String> {
     }
 }
 
-/// 4-point, 3rd-order Hermite: the value `t` of the way from `b` to `c`.
-fn hermite(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
-    let c1 = 0.5 * (c - a);
-    let c2 = a - 2.5 * b + 2.0 * c - 0.5 * d;
-    let c3 = 0.5 * (d - a) + 1.5 * (b - c);
-    ((c3 * t + c2) * t + c1) * t + b
+/// Reading between the samples: a windowed sinc, as in Vuuvee's resampler (16 zero crossings a side,
+/// Hann window, cut at 0.95 of the lower Nyquist), but from a table made once, so it can run in the audio
+/// thread. A 4-point curve was here first; it lost 0.8 dB in the top octave, and by an amount that came
+/// and went as the two clocks slid past each other.
+struct Sinc {
+    /// samples on each side of the place read
+    half: usize,
+    /// PLACES + 1 rows of 2 * half weights: row p is for the place p / PLACES of the way between two samples
+    table: Vec<f32>,
+}
+
+const PLACES: usize = 512;
+
+impl Sinc {
+    /// For reading a stream at `nominal` source frames per frame read.
+    fn new(nominal: f64) -> Sinc {
+        let cutoff = (1.0 / nominal).min(1.0) * 0.95;
+        let half = (16.0 / cutoff).ceil() as usize;
+        let mut table = Vec::with_capacity((PLACES + 1) * 2 * half);
+        for place in 0..=PLACES {
+            let t = place as f64 / PLACES as f64;
+            let row: Vec<f64> = (0..2 * half)
+                .map(|k| {
+                    let d = k as f64 - (half as f64 - 1.0) - t; // how far sample k is from the place read
+                    let window = 0.5 + 0.5 * (std::f64::consts::PI * d / (half as f64 + 1.0)).cos();
+                    let x = std::f64::consts::PI * d * cutoff;
+                    (if x.abs() < 1e-9 { 1.0 } else { x.sin() / x }) * cutoff * window
+                })
+                .collect();
+            // each row sums to one: a steady level stays exactly what it was
+            let sum: f64 = row.iter().sum();
+            table.extend(row.iter().map(|w| (w / sum) as f32));
+        }
+        Sinc { half, table }
+    }
+
+    /// Frames that must be in the store to read one.
+    fn needs(&self) -> usize {
+        2 * self.half
+    }
+
+    /// Channel `c` at `phase` (0 to 1) of the way between the store's frames `half - 1` and `half`.
+    fn read(&self, store: &Ring, channels: usize, c: usize, phase: f64) -> f32 {
+        let at = phase * PLACES as f64;
+        let (row, blend) = (at as usize, (at - at.floor()) as f32);
+        let taps = 2 * self.half;
+        let (a, b) = (&self.table[row * taps..(row + 1) * taps], &self.table[(row + 1) * taps..(row + 2) * taps]);
+        let mut sum = 0.0f32;
+        for k in 0..taps {
+            sum += store.peek(k * channels + c) * (a[k] + blend * (b[k] - a[k]));
+        }
+        sum
+    }
 }
 
 /// The playback side of the ring: reads it at the target's rate, holding its fill at the cushion.
 struct Reader {
+    sinc: Sinc,
     ring: Arc<Ring>,
     meters: Arc<Meters>,
     in_ch: usize,
@@ -230,7 +279,7 @@ impl Reader {
 
         let mut frames = 0;
         for frame in out.chunks_mut(self.out_ch) {
-            if self.primed && r.len() / in_ch < 4 {
+            if self.primed && r.len() / in_ch < self.sinc.needs() {
                 self.primed = false;
                 m.dry.fetch_add(1, Ordering::Relaxed);
             }
@@ -241,7 +290,7 @@ impl Reader {
             for (c, s) in frame.iter_mut().enumerate() {
                 // front left and right are kept; a mono source goes to both; other channels stay silent
                 let from = if c < in_ch.min(2) || (c < in_ch && in_ch == self.out_ch) { Some(c) } else if in_ch == 1 && c < 2 { Some(0) } else { None };
-                *s = from.map_or(0.0, |c| hermite(r.peek(c), r.peek(in_ch + c), r.peek(2 * in_ch + c), r.peek(3 * in_ch + c), self.phase as f32));
+                *s = from.map_or(0.0, |c| self.sinc.read(r, in_ch, c, self.phase));
             }
             self.phase += step;
             let whole = self.phase as usize;
@@ -521,7 +570,7 @@ unsafe fn playback(
     // What the ring must hold, on average, when a block is about to be read: that whole block, half a
     // block of the source's (its blocks come at any moment between two reads), and the cushion asked for.
     let leaving = if opened.exclusive { block as f64 } else { block as f64 / 2.0 } * reader.nominal;
-    reader.cushion = (leaving + in_block as f64 / 2.0 + cushion_ms as f64 / 1000.0 * reader.in_rate as f64) as usize + 4;
+    reader.cushion = (leaving + in_block as f64 / 2.0 + cushion_ms as f64 / 1000.0 * reader.in_rate as f64) as usize + reader.sinc.needs();
     reader.slack = 2 * (leaving as usize + in_block as usize);
     // exclusive mode takes one whole buffer per event; the first is silence
     if opened.exclusive {
@@ -627,6 +676,7 @@ unsafe fn direct(
     let _ = ready.send(Ok(Opened { in_block, out_block: period, exclusive: true, out_bits: format_bits.1, note: String::new(), direct: true }));
 
     // a short store of the source's frames, to read between them at the target's rate
+    let sinc = Sinc::new(nominal);
     let store = Ring::new(in_rate as usize / 4 * in_ch);
     let silence = vec![0.0f32; 4096 * in_ch];
     let mut sound = vec![0.0f32; room as usize * out_ch];
@@ -679,11 +729,10 @@ unsafe fn direct(
 
             // read everything that has come, at the target's rate
             let mut frames = 0usize;
-            while store.len() / in_ch >= 4 && frames < (room - queued) as usize {
+            while store.len() / in_ch >= sinc.needs() && frames < (room - queued) as usize {
                 let frame = &mut sound[frames * out_ch..(frames + 1) * out_ch];
                 for (c, s) in frame.iter_mut().enumerate() {
-                    let from = if c < in_ch { c } else { 0 };
-                    *s = hermite(store.peek(from), store.peek(in_ch + from), store.peek(2 * in_ch + from), store.peek(3 * in_ch + from), phase as f32);
+                    *s = sinc.read(&store, in_ch, if c < in_ch { c } else { 0 }, phase);
                 }
                 phase += step;
                 let whole = phase as usize;
@@ -693,9 +742,9 @@ unsafe fn direct(
             }
             // what did not fit (the queue is full: we are far ahead of the device) is let go
             let left = store.len() / in_ch;
-            if left > 8 {
-                store.skip((left - 3) * in_ch);
-                m.dropped.fetch_add((left - 3) as u64, Ordering::Relaxed);
+            if left > sinc.needs() + 8 {
+                store.skip((left - (sinc.needs() - 1)) * in_ch);
+                m.dropped.fetch_add((left - (sinc.needs() - 1)) as u64, Ordering::Relaxed);
             }
             if frames == 0 {
                 continue;
@@ -708,8 +757,9 @@ unsafe fn direct(
             hand_over(block, data, format_bits, &mut noise);
             render.ReleaseBuffer(frames as u32, 0)?;
             m.played.fetch_add(frames as u64, Ordering::Relaxed);
-            // the first of these frames plays when what was queued ahead of it has been played
-            let waits = queued as u64 * 1_000_000 / target.rate as u64;
+            // the first of these frames plays when what was queued ahead of it has been played; and it was
+            // read half the sinc's length behind the newest sound from the source
+            let waits = queued as u64 * 1_000_000 / target.rate as u64 + sinc.half as u64 * 1_000_000 / in_rate as u64;
             m.wait_sum.fetch_add(waits, Ordering::Relaxed);
             m.wait_count.fetch_add(1, Ordering::Relaxed);
             m.wait_longest.fetch_max(waits, Ordering::Relaxed);
@@ -790,6 +840,7 @@ pub fn run(
     let (said, heard) = channel::<Result<Opened, String>>();
     let (tgt, m, s) = (target.clone(), meters.clone(), stop.clone());
     let reader = Reader {
+        sinc: Sinc::new(source.rate as f64 / target.rate as f64),
         ring,
         meters: meters.clone(),
         in_ch: source.channels,
