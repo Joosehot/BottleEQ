@@ -222,12 +222,13 @@ Not done: nobody but the program's own test has pressed Measure in the window.
 
 ### Stage 2: correcting
 
-![Measured, corrected and measured again](docs/window-corrected.png)
+![The measured curve and its correction, the mirror image](docs/window-corrected.png)
 
-**Correct** turns the last measurement over into the equalizer's curve (`src/calibrate.rs`), so that what
-reaches the microphone becomes flat. In the picture: the faint blue line is what was measured before,
-the amber curve the correction, the white dashes at 0 dB the flat that is aimed at, and the bright blue
-line what was measured again through the correction.
+**Correct** turns the last measurement over into a correction (`src/calibrate.rs`), so that what reaches
+the microphone becomes flat. In the picture (the calibration "Speakers exact"): the faint blue line is
+what was measured, the pale curve the correction, its mirror image, and the amber line at 0 dB the
+curve set by hand, on top of the correction and here flat. Measured again through the correction, a
+bright blue line shows how near flat it came.
 
 - **What is set right** is the speakers and the room alone: the measurement less the equalizer's curve
   the sweep went through. So it can be corrected again from any later measurement.
