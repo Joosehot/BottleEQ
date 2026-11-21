@@ -222,7 +222,7 @@ Not done: nobody but the program's own test has pressed Measure in the window.
 
 ### Stage 2: correcting
 
-![The measured curve and its correction, the mirror image](docs/window-corrected.png)
+![The measured curve and its correction, the mirror image](docs/correction.png)
 
 **Correct** turns the last measurement over into a correction (`src/calibrate.rs`), so that what reaches
 the microphone becomes flat. In the picture (the calibration "Speakers exact"): the faint blue line is
