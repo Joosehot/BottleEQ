@@ -12,7 +12,12 @@
 //! - **Flat** puts the bands and the points back to nothing: the sound passes as it came.
 //! - **Measure** plays a sweep out of the speakers and records it with the microphone chosen
 //!   (`measure.rs`); what reached the microphone is drawn in blue on the curve's scale, dotted where it
-//!   is not clearly above the noise. It can be measured again at any time; the line is the last one.
+//!   is not to be believed. It can be measured again at any time; the line is the last one.
+//! - **Correct** turns the last measurement over into the equalizer's curve (`calibrate.rs`), so that
+//!   what reaches the microphone becomes flat: the amber curve is then the correction, the faint blue
+//!   line what was measured before it, the white dashes at 0 dB the flat that is aimed at. Measure
+//!   again to see how near it came. **Save** keeps the curve as a calibration by name; the list beside
+//!   it sets one that was kept.
 //!
 //! The sound changes while a handle is dragged: the curve goes to the audio thread through `Settings`
 //! (atomics) at every move, and the audio thread slides to it. The audio thread never waits for the
@@ -26,6 +31,7 @@ use crate::eq::{self, Curve, Eq, Kind, Mode, Point, Settings, BANDS, CENTRES, CU
 use crate::ring::Ring;
 use crate::spectrum::{Spectrum, SIZE};
 use crate::audio::{self, run, Input, Output, Running};
+use crate::calibrate::{self, Calibration};
 use crate::measure::{self, Measured};
 
 /// the graph's edges: frequencies, the curve's dB each way, the spectrum's lowest level
@@ -61,6 +67,8 @@ pub struct Start {
     /// the microphone, and whether to measure by itself a second after opening
     pub mic: Option<String>,
     pub measure: bool,
+    /// and then correct and measure again, by itself
+    pub correct: bool,
 }
 
 /// The points a curve starts from: one at each end and one between (each between two bands), all at 0 dB.
@@ -178,7 +186,17 @@ struct Window {
     measuring: Option<(std::sync::mpsc::Receiver<Result<Measured, String>>, Instant)>,
     measured: Option<Measured>,
     measure_said: String,
-    measure_soon: bool,
+    measure_shown: String,
+    measure_soon: Option<Instant>,
+    correct_soon: bool,
+    // calibrating
+    /// what the correction that is set was made from: frequencies, the speakers and the room alone,
+    /// and which of them are within reach
+    before: Option<(Vec<f32>, Vec<f32>, Vec<bool>)>,
+    calibrations: Vec<Calibration>,
+    /// the calibration that is set (empty: none), and the name one would be saved under
+    calibration: String,
+    save_as: String,
 }
 
 impl Window {
@@ -328,13 +346,97 @@ impl Window {
                 if button.clicked() {
                     self.measure();
                 }
+                let correct = ui.add_enabled(self.measured.is_some(), egui::Button::new("Correct")).on_hover_text(
+                    "Turns the last measurement over into the equalizer's curve, so that what reaches the microphone becomes flat. Nothing is raised more than 6 dB, and nothing is done where the measurement is not to be believed or the speakers have nothing to give.\nThen measure again to see how near flat it came.",
+                );
+                if correct.clicked() {
+                    self.correct();
+                }
             });
             let text = match &self.measuring {
-                Some((_, began)) => format!("measuring: keep quiet ... {:.0} s", (measure::BEFORE + measure::SECONDS + measure::AFTER + 1.0 - began.elapsed().as_secs_f64()).max(0.0)),
+                Some((_, began)) => format!("measuring: keep quiet ... {:.0} s", (measure::TAKES - began.elapsed().as_secs_f64()).max(0.0)),
                 None => self.measure_said.clone(),
             };
-            ui.label(egui::RichText::new(text).small());
+            self.measure_shown = text;
         });
+        ui.horizontal(|ui| {
+            ui.label("Calibration");
+            let shown = if self.calibration.is_empty() { "none".to_string() } else { self.calibration.clone() };
+            let mut chosen = None;
+            egui::ComboBox::from_id_salt("calibration").width(150.0).selected_text(shown).show_ui(ui, |ui| {
+                for c in &self.calibrations {
+                    if ui.selectable_label(self.calibration == c.name, format!("{}  ({}, {})", c.name, c.device, c.day)).clicked() {
+                        chosen = Some(c.clone());
+                    }
+                }
+            });
+            if let Some(c) = chosen {
+                c.set(&self.settings);
+                self.mode.clear();
+                self.before = (!c.hz.is_empty()).then(|| (c.hz.clone(), c.raw.clone(), c.certain.clone()));
+                self.save_as = c.name.clone();
+                self.calibration = c.name;
+            }
+            ui.label("keep as");
+            ui.add(egui::TextEdit::singleline(&mut self.save_as).desired_width(120.0).hint_text("Speakers"));
+            if ui.button("Save").on_hover_text("Keeps the curve that is set, with the measurement it was made from, as a calibration of this name (a file in the folder calibrations).").clicked() {
+                self.save();
+            }
+        });
+        // what the measuring last said, on a line of its own
+        if !self.measure_shown.is_empty() {
+            ui.label(egui::RichText::new(&self.measure_shown).small());
+        }
+    }
+
+    /// Turn the last measurement over into the equalizer's curve.
+    fn correct(&mut self) {
+        let Some(m) = &self.measured else { return };
+        let want = calibrate::wanted(m);
+        if !want.reach.iter().any(|r| *r) {
+            self.measure_said = "nothing of the measurement is within reach: there is nothing to correct by".to_string();
+            return;
+        }
+        let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, self.rate());
+        self.settings.set_all(&fitted.gains);
+        self.settings.set_points(&fitted.points);
+        self.mode.clear();
+        self.calibration.clear();
+        let alone = calibrate::raw(m);
+        let from_flat = calibrate::spread(&alone, &want.reach);
+        self.before = Some((m.hz.clone(), alone, want.reach));
+        let heard = if self.running.is_some() { "measure again to see how near flat it came" } else { "press Start: it is heard, and can be measured, only through the path" };
+        self.measure_said = format!("corrected ({from_flat:.1} dB from flat before): {heard}");
+    }
+
+    /// Keep the curve that is set as a calibration under the name given.
+    fn save(&mut self) {
+        let name = self.save_as.trim().to_string();
+        if name.is_empty() {
+            self.measure_said = "give the calibration a name (Speakers, Headphones ...)".to_string();
+            return;
+        }
+        let set = self.settings.get();
+        let (hz, raw, certain) = self.before.clone().unwrap_or_default();
+        let calibration = Calibration {
+            name: name.clone(),
+            device: self.target.map_or(String::new(), |t| self.outputs[t].name.clone()),
+            microphone: self.mic.map_or(String::new(), |i| self.inputs[i].name.clone()),
+            day: calibrate::today(),
+            gains: set.gains,
+            points: set.points().to_vec(),
+            hz,
+            raw,
+            certain,
+        };
+        match calibration.save() {
+            Ok(path) => {
+                self.measure_said = format!("kept: {path}");
+                self.calibrations = calibrate::calibrations();
+                self.calibration = name;
+            }
+            Err(why) => self.measure_said = why,
+        }
     }
 
     /// Begin a measurement: the sweep goes where music goes. While the path runs that is its source,
@@ -350,8 +452,10 @@ impl Window {
         };
         let (said, heard) = std::sync::mpsc::channel();
         let input = self.inputs[mic].clone();
+        // the curve the sweep goes through: the one set, when the path runs and the equalizer is on
+        let through = (self.running.is_some() && self.settings.on.load(Ordering::Relaxed)).then(|| self.settings.get());
         std::thread::spawn(move || {
-            let _ = said.send(measure::measure(&input, &play_to, SWEEP));
+            let _ = said.send(measure::measure(&input, &play_to, SWEEP, through.as_ref()));
         });
         self.measuring = Some((heard, Instant::now()));
     }
@@ -362,8 +466,21 @@ impl Window {
         match heard.try_recv() {
             Ok(Ok(m)) => {
                 let clipped = if m.peak >= 0.99 { "; THE MICROPHONE CLIPPED: turn it down and measure again" } else { "" };
-                self.measure_said = format!("measured: {:.0}% clearly above the noise{clipped}", 100.0 * m.share());
+                // against the measurement the correction was made from, at the frequencies within its reach
+                let flat = match &self.before {
+                    Some((hz, alone, reach)) if hz.len() == m.hz.len() => {
+                        let both: Vec<bool> = (0..hz.len()).map(|i| reach[i] && m.certain[i]).collect();
+                        format!("; from flat: {:.1} dB before, {:.1} dB now", calibrate::spread(alone, &both), calibrate::spread(&m.db, &both))
+                    }
+                    _ => String::new(),
+                };
+                self.measure_said = format!("measured: {:.0}% to be believed{flat}{clipped}", 100.0 * m.share());
                 (self.measured, self.measuring) = (Some(m), None);
+                if self.correct_soon {
+                    self.correct_soon = false;
+                    self.correct();
+                    self.measure_soon = Some(Instant::now() + std::time::Duration::from_millis(1500));
+                }
             }
             Ok(Err(why)) => (self.measure_said, self.measuring) = (why, None),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => (self.measure_said, self.measuring) = ("the measurement broke off".to_string(), None),
@@ -444,8 +561,24 @@ impl Window {
         }
         painter.line(line, Stroke::new(2.0, GREEN));
 
-        // what was measured at the microphone, on the curve's scale: whole where it is clearly above
-        // the noise, dotted where it is not
+        // the flat that a correction aims at, and what was measured before it (the speakers and the room
+        // alone), faint
+        if let Some((hz, alone, reach)) = &self.before {
+            let y = y_of(graph, 0.0);
+            for step in (0..(graph.width() / 12.0) as usize).filter(|step| step % 2 == 0) {
+                let x = graph.left() + step as f32 * 12.0;
+                painter.line_segment([pos2(x, y), pos2((x + 12.0).min(graph.right()), y)], Stroke::new(1.5, Color32::from_gray(230)));
+            }
+            painter.text(pos2(graph.right() - 6.0, y - 3.0), egui::Align2::RIGHT_BOTTOM, "flat (aimed at)", small.clone(), Color32::from_gray(230));
+            let at = |i: usize| pos2(x_of(graph, hz[i]), graph.center().y - alone[i] / SPAN * graph.height() / 2.0);
+            for i in 1..hz.len() {
+                if reach[i - 1] && reach[i] {
+                    painter.line_segment([at(i - 1), at(i)], Stroke::new(1.5, BLUE.gamma_multiply(0.4)));
+                }
+            }
+        }
+        // what was measured at the microphone, on the curve's scale: whole where it is to be believed,
+        // dotted where it is not
         if let Some(m) = &self.measured {
             // not held at the graph's edge as the curve is: what is weaker than the graph shows leaves it
             let at = |i: usize| pos2(x_of(graph, m.hz[i]), graph.center().y - m.db[i] / SPAN * graph.height() / 2.0);
@@ -456,7 +589,7 @@ impl Window {
                     false => {}
                 }
             }
-            painter.text(pos2(graph.left() + 6.0, graph.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, "blue: measured at the microphone (dotted: not clearly above the noise)", small.clone(), BLUE);
+            painter.text(pos2(graph.left() + 6.0, graph.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, if self.before.is_some() { "blue: measured at the microphone (dotted: not to be believed; faint: before the correction)" } else { "blue: measured at the microphone (dotted: not to be believed)" }, small.clone(), BLUE);
         }
 
         // the pointer and the handles
@@ -638,8 +771,8 @@ impl eframe::App for Window {
         self.spectrum.take(&self.ring);
         self.spectrum.look(ui.input(|i| i.stable_dt).min(0.1));
         self.measured();
-        if self.measure_soon && self.opened.elapsed().as_secs_f32() > 1.0 {
-            self.measure_soon = false;
+        if self.measure_soon.is_some_and(|at| Instant::now() >= at) {
+            self.measure_soon = None;
             self.measure();
         }
         if self.looked.elapsed().as_secs_f32() > 0.5 {
@@ -739,13 +872,19 @@ pub fn open(start: Start) -> Result<(), String> {
         measuring: None,
         measured: None,
         measure_said: String::new(),
-        measure_soon: start.measure,
+        measure_shown: String::new(),
+        measure_soon: start.measure.then(|| Instant::now() + std::time::Duration::from_secs(1)),
+        correct_soon: start.correct,
+        before: None,
+        calibrations: calibrate::calibrations(),
+        calibration: String::new(),
+        save_as: String::new(),
     };
     if begin {
         window.start();
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([700.0, 430.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
+        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([720.0, 480.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
         ..Default::default()
     };
     eframe::run_native("Bottle EQ", options, Box::new(move |made| {

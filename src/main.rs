@@ -8,6 +8,10 @@
 //!                                                      a sweep out of the speakers, recorded by the
 //!                                                      microphone: what reaches the listening place. With
 //!                                                      --from it goes through the path and the equalizer
+//!       ... --correct [--save <name>]                  and then: the measured curve turned over into the
+//!                                                      equalizer's, measured again through it, and kept
+//!                                                      as a calibration of that name
+//!   bottle-eq calibrations                             the calibrations kept
 //!   bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other
 //!   bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
 //!   bottle-eq playtest --from <device> --to <device> --file <wav> [--record <folder>] [--level <0..1>]
@@ -23,6 +27,7 @@
 //!
 //!   --gains <ten numbers>    the ten bands' gains in dB, low to high, e.g. --gains 4,2,0,0,0,0,0,0,2,4
 //!   --mode <name>            a mode from modes.txt, e.g. --mode "bass boost"
+//!   --calibration <name>     a calibration kept (its bands and points), e.g. --calibration speakers
 //!   --points <points>        points on top of the bands, as in FL Studio's EQ: each a filter of its own,
 //!                            e.g. --points "100:cut 1k:-2 12k:+8:spike" (a slope at the start, a dip, a
 //!                            spike at the end); see `points_of` for how a point is written
@@ -35,12 +40,14 @@
 //!
 //! The window begins at once when --exclusive or --shared is given with both devices; else it waits for
 //! Start. For trying it out: --file <wav> [--level x] is played to the source, --drag <point>:<hz>:<dB>
-//! drags a point there by itself, --mic <microphone> --measure measures by itself a second after opening,
+//! drags a point there by itself, --mic <microphone> --measure measures by itself a second after opening
+//! (with --correct it then corrects and measures again),
 //! and --shot <bmp> [--seconds n] keeps a picture of the window and closes.
 //!
 //! Steps 1 to 5 of 5.
 
 mod audio;
+mod calibrate;
 mod eq;
 mod measure;
 mod ring;
@@ -292,6 +299,7 @@ fn main() {
     let level_given: Option<f32> = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number")));
     let level = level_given.unwrap_or(1.0);
     let (mic_text, keep_text) = (take("--mic"), take("--keep"));
+    let (calibration_text, save_text) = (take("--calibration"), take("--save"));
     let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
     let (shot, drag) = (take("--shot"), take("--drag"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
@@ -302,7 +310,7 @@ fn main() {
         }
         None => false,
     };
-    let (exclusive, shared, measure_flag) = (flag("--exclusive"), flag("--shared"), flag("--measure"));
+    let (exclusive, shared, measure_flag, correct) = (flag("--exclusive"), flag("--shared"), flag("--measure"), flag("--correct"));
     let gains = Arc::new(Settings::default());
     let given = gains_text.map(|g| parse_gains(&g));
     given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
@@ -311,6 +319,11 @@ fn main() {
         let mode = eq::mode(name).unwrap_or_else(|e| fail(&e));
         println!("mode: {}", mode.name);
         gains.set_all(&mode.gains);
+    }
+    if let Some(name) = &calibration_text {
+        let calibration = calibrate::calibration(name).unwrap_or_else(|e| fail(&e));
+        println!("calibration: {} ({}, measured {})", calibration.name, calibration.device, calibration.day);
+        calibration.set(&gains);
     }
     if let Some(text) = &points_text {
         gains.set_points(&points_of(text).unwrap_or_else(|e| fail(&e)));
@@ -342,6 +355,7 @@ fn main() {
                 shot: shot.map(|path| (path, seconds.unwrap_or(4.0))),
                 mic: mic_text,
                 measure: measure_flag,
+                correct,
             };
             window::open(start).unwrap_or_else(|e| fail(&e));
         }
@@ -373,19 +387,103 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(500));
                 running
             });
-            println!("measuring with \"{}\": a sweep from 20 Hz to 20 kHz, about 15 seconds ...", mic.name);
-            let m = measure::measure(&mic, source.as_ref().unwrap_or(&target), level_given.unwrap_or(0.5)).unwrap_or_else(|e| fail(&e));
-            drop(running);
-            println!("the sweep arrived {:.2} s into the recording, {:.1} dB of what was sent; the recording's loudest sample: {} dB{}", m.arrived, m.level, db(m.peak).trim(), if m.peak >= 0.99 { "  (IT CLIPPED: turn the microphone down)" } else { "" });
-            println!("      Hz      dB   above the noise");
+            let through = || running.is_some().then(|| gains.get());
+            let play_to = source.as_ref().unwrap_or(&target);
+            let level = level_given.unwrap_or(0.5);
+            let said = |m: &measure::Measured| {
+                println!("the sweep arrived {:.2} s into the recording, {:.1} dB of what was sent; the recording's loudest sample: {} dB{}", m.arrived, m.level, db(m.peak).trim(), if m.peak >= 0.99 { "  (IT CLIPPED: turn the microphone down)" } else { "" });
+                println!("{:.0}% of the frequencies from 20 Hz to 20 kHz are to be believed: clearly ({} dB) above the noise, and {} dB quieter (within {}) in the quieter sweep", 100.0 * m.share(), measure::CLEAR, measure::QUIETER, measure::STEADY);
+            };
+            println!("measuring with \"{}\": a sweep from 20 Hz to 20 kHz, and once more 10 dB quieter; about {:.0} seconds ...", mic.name, measure::TAKES);
+            let m = measure::measure(&mic, play_to, level, through().as_ref()).unwrap_or_else(|e| fail(&e));
+            said(&m);
+            println!("      Hz      dB   above the noise   off in the quieter sweep");
             for i in (0..m.hz.len()).step_by(8) {
-                println!("  {:>6.0}  {:>+6.1}   {:>5.0} dB  {}", m.hz[i], m.db[i], m.over_noise[i], if m.certain[i] { "" } else { "?" });
+                println!("  {:>6.0}  {:>+6.1}   {:>5.0} dB   {:>+6.1} dB  {}", m.hz[i], m.db[i], m.over_noise[i], m.off_level[i], if m.certain[i] { "" } else { "?" });
             }
-            println!("{:.0}% of the frequencies from 20 Hz to 20 kHz are clearly ({} dB) above the noise; \"?\" marks the others", 100.0 * m.share(), measure::CLEAR);
-            if let Some(path) = keep_text {
-                let rows: Vec<String> = (0..m.hz.len()).map(|i| format!("{:.2},{:.3},{},{:.1}", m.hz[i], m.db[i], m.certain[i] as u8, m.over_noise[i])).collect();
-                std::fs::write(&path, format!("hz,db,certain,above_noise_db\n{}\n", rows.join("\n"))).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+            println!("\"?\" marks what is not to be believed");
+            let rows = |m: &measure::Measured| -> Vec<String> { (0..m.hz.len()).map(|i| format!("{:.2},{:.3},{},{:.1},{:.2},{:.3}", m.hz[i], m.db[i], m.certain[i] as u8, m.over_noise[i], m.off_level[i], m.eq[i])).collect() };
+            let keep = |path: &str, m: &measure::Measured| {
+                std::fs::write(path, format!("hz,db,certain,above_noise_db,off_in_quieter_db,eq_db\n{}\n", rows(m).join("\n"))).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
                 println!("kept: {path}");
+            };
+            if let Some(path) = &keep_text {
+                keep(path, &m);
+            }
+            if correct {
+                // the measured curve turned over into the equalizer's
+                let want = calibrate::wanted(&m);
+                let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, target.rate as f64);
+                gains.set_all(&fitted.gains);
+                gains.set_points(&fitted.points);
+                println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);
+                show_gains(&gains, target.rate);
+                let before = calibrate::spread(&calibrate::raw(&m), &want.reach);
+                let (from, to) = ((0..m.hz.len()).find(|i| want.reach[*i]).map_or(0.0, |i| m.hz[i]), (0..m.hz.len()).rev().find(|i| want.reach[*i]).map_or(0.0, |i| m.hz[i]));
+                println!("within reach (believed, and not more than {} dB under the rest): {} frequencies from {from:.0} Hz to {to:.0} Hz", calibrate::REACH, want.reach.iter().filter(|r| **r).count());
+                if running.is_some() {
+                    // and measured again through it, at the same frequencies
+                    std::thread::sleep(Duration::from_secs(1));
+                    println!("measuring again through the correction ...");
+                    let again = measure::measure(&mic, play_to, level, through().as_ref()).unwrap_or_else(|e| fail(&e));
+                    said(&again);
+                    println!("      Hz   before    after   the correction");
+                    for i in (0..m.hz.len()).step_by(8) {
+                        println!("  {:>6.0}  {:>+6.1}   {:>+6.1}   {:>+6.1}  {}", m.hz[i], calibrate::raw(&m)[i], again.db[i], again.eq[i], if want.reach[i] { "" } else { "-" });
+                    }
+                    let both: Vec<bool> = (0..m.hz.len()).map(|i| want.reach[i] && again.certain[i]).collect();
+                    println!(
+                        "\"-\" marks what is out of reach. From flat, over the {} frequencies within reach and believed again: {:.2} dB before, {:.2} dB after (the usual distance of the level from its mean)",
+                        both.iter().filter(|b| **b).count(),
+                        calibrate::spread(&calibrate::raw(&m), &both),
+                        calibrate::spread(&again.db, &both)
+                    );
+                    if let Some(path) = &keep_text {
+                        keep(&path.replace(".csv", "_after.csv"), &again);
+                    }
+                } else {
+                    println!("from flat before: {before:.2} dB. Not measured again: without --from the sweep does not pass the equalizer");
+                }
+                if let Some(name) = save_text {
+                    let set = gains.get();
+                    let calibration = calibrate::Calibration { name, device: target.name.clone(), microphone: mic.name.clone(), day: calibrate::today(), gains: set.gains, points: set.points().to_vec(), hz: m.hz.clone(), raw: calibrate::raw(&m), certain: m.certain.clone() };
+                    println!("kept: {} (use it with --calibration \"{}\")", calibration.save().unwrap_or_else(|e| fail(&e)), calibration.name);
+                }
+            }
+            drop(running);
+        }
+        Some("correct") => {
+            // the correction a kept measurement asks for, and how flat it should make it (not measured)
+            let path = keep_text.unwrap_or_else(|| fail("correct needs --keep <the csv file a measurement was kept in>"));
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+            let rows: Vec<Vec<f32>> = text.lines().skip(1).map(|l| l.split(',').filter_map(|n| n.trim().parse().ok()).collect()).filter(|r: &Vec<f32>| r.len() >= 3).collect();
+            let column = |c: usize| -> Vec<f32> { rows.iter().map(|r| r.get(c).copied().unwrap_or(0.0)).collect() };
+            let n = rows.len();
+            let m = measure::Measured { hz: column(0), db: column(1), certain: column(2).iter().map(|c| *c != 0.0).collect(), over_noise: column(3), off_level: column(4), eq: column(5), peak: 0.0, arrived: 0.0, level: 0.0 };
+            if n == 0 {
+                fail(&format!("{path}: no measurement in it"));
+            }
+            let want = calibrate::wanted(&m);
+            let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0);
+            gains.set_all(&fitted.gains);
+            gains.set_points(&fitted.points);
+            println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);
+            show_gains(&gains, 48000);
+            let (alone, set) = (calibrate::raw(&m), gains.get());
+            let after: Vec<f32> = (0..n).map(|i| alone[i] + set.response_db(48000.0, m.hz[i] as f64)).collect();
+            println!("      Hz   measured   wanted   the curve   with it");
+            for i in (0..n).step_by(8) {
+                println!("  {:>6.0}   {:>+6.1}   {:>+6.1}   {:>+6.1}   {:>+6.1}  {}", m.hz[i], alone[i], want.db[i], set.response_db(48000.0, m.hz[i] as f64), after[i], if want.reach[i] { "" } else { "-" });
+            }
+            println!("\"-\" marks what is out of reach. From flat within reach ({} frequencies): {:.2} dB as measured, {:.2} dB with the correction if the speakers do as the curve says (not measured)", want.reach.iter().filter(|r| **r).count(), calibrate::spread(&alone, &want.reach), calibrate::spread(&after, &want.reach));
+        }
+        Some("calibrations") => {
+            let all = calibrate::calibrations();
+            if all.is_empty() {
+                println!("no calibration is kept yet: bottle-eq measure --mic <microphone> --from <device> --to <device> --correct --save <name>");
+            }
+            for c in all {
+                println!("{:<20} {}, measured {} with {}: {} points", c.name, c.device, c.day, c.microphone, c.points.len());
             }
         }
         Some("run") => {
@@ -617,6 +715,6 @@ fn main() {
                 println!("kept: {dir}/captured.wav (what came from the source), {dir}/handed.wav (what the target was given)");
             }
         }
-        _ => fail("commands: window | devices | measure --mic <microphone> --to <device> | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
+        _ => fail("commands: window | devices | measure --mic <microphone> --to <device> [--correct --save <name>] | calibrations | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
     }
 }

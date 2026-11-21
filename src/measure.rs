@@ -14,12 +14,18 @@
 //! - **The curve** is the level in each sixth of an octave, every 24th of an octave, in dB against its
 //!   own average between 200 Hz and 5 kHz (how loud the microphone is set says nothing).
 //!
+//! - **Twice, at two levels**: the sweep is played once more, 10 dB quieter. Speakers and a room answer
+//!   the same at any level; a frequency that does not come out 10 dB quieter (within 3 dB) is not being
+//!   answered by them alone (small speakers below their range, a microphone that gates or evens out
+//!   what it hears), and is marked uncertain too: no equalizer can set right what changes with level.
+//!
 //! The microphone's own response is in the curve: what is measured is speakers, room and microphone
 //! together, and a cheap microphone's weak bass or treble cannot be told from the room's.
 
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 use crate::audio::{self, Input, Output};
+use crate::eq::Curve;
 
 pub const LOW: f64 = 20.0;
 pub const HIGH: f64 = 20000.0;
@@ -37,6 +43,10 @@ const POST: f64 = 0.3;
 const NOISE_AT: [f64; 3] = [1.0, 1.7, 2.4];
 /// how far above the noise a level must be to be believed, in dB
 pub const CLEAR: f32 = 10.0;
+/// the second sweep: this much quieter than the first, in dB, and how far from exactly that much
+/// quieter a frequency may come out and still be believed
+pub const QUIETER: f32 = 10.0;
+pub const STEADY: f32 = 3.0;
 
 /// The sweep at a moment, at full height: it fades in over a tenth of a second and out over a hundredth.
 fn sweep_at(t: f64) -> f64 {
@@ -59,8 +69,13 @@ pub fn sweep(rate: u32, level: f32) -> Vec<f32> {
 pub struct Measured {
     pub hz: Vec<f32>,
     pub db: Vec<f32>,
-    /// clearly above the noise
+    /// to be believed: clearly above the noise, and (when measured at two levels) the same at both
     pub certain: Vec<bool>,
+    /// how much quieter than the 10 dB asked each frequency came out of the quieter sweep, in dB
+    /// (0: just as it should); empty when only one level was measured
+    pub off_level: Vec<f32>,
+    /// the equalizer's curve the sweep went through, in dB at each frequency (0 where it did not)
+    pub eq: Vec<f32>,
     /// how far above the noise each level is, in dB
     pub over_noise: Vec<f32>,
     /// the loudest sample of the recording (1 is the most a recording holds: it clipped)
@@ -73,7 +88,7 @@ pub struct Measured {
 }
 
 impl Measured {
-    /// The share of the frequencies that are clearly above the noise.
+    /// The share of the frequencies that are to be believed.
     pub fn share(&self) -> f32 {
         self.certain.iter().filter(|c| **c).count() as f32 / self.certain.len().max(1) as f32
     }
@@ -176,14 +191,12 @@ pub fn analyse(recording: &[f32], rate: u32) -> Result<Measured, String> {
     let all: Vec<f32> = (0..hz.len()).filter(|i| certain[*i]).map(|i| level[i]).collect();
     let of = if middle.is_empty() { &all } else { &middle };
     let average = of.iter().sum::<f32>() / of.len() as f32;
-    Ok(Measured { hz: hz.iter().map(|hz| *hz as f32).collect(), db: level.iter().map(|l| l - average).collect(), certain, over_noise, peak, arrived: spike as f32 / rate as f32, level: average })
+    let eq = vec![0.0; hz.len()];
+    Ok(Measured { hz: hz.iter().map(|hz| *hz as f32).collect(), db: level.iter().map(|l| l - average).collect(), certain, off_level: Vec::new(), eq, over_noise, peak, arrived: spike as f32 / rate as f32, level: average })
 }
 
-/// Measure: record the microphone, play the sweep to an output like any program would, and compare.
-/// It takes about fifteen seconds. `play_to` is the device the sound is on its way to the speakers
-/// from: the path's source when the path runs (the sweep then passes the equalizer as music does),
-/// else the speakers themselves.
-pub fn measure(microphone: &Input, play_to: &Output, level: f32) -> Result<Measured, String> {
+/// One sweep: record the microphone, play the sweep to an output like any program would, and compare.
+fn once(microphone: &Input, play_to: &Output, level: f32) -> Result<Measured, String> {
     let recording = audio::record(microphone)?;
     std::thread::sleep(std::time::Duration::from_secs_f64(BEFORE));
     let sound: Vec<f32> = sweep(play_to.rate, level).iter().flat_map(|s| [*s, *s]).collect();
@@ -191,6 +204,34 @@ pub fn measure(microphone: &Input, play_to: &Output, level: f32) -> Result<Measu
     std::thread::sleep(std::time::Duration::from_secs_f64(AFTER));
     let (rate, sound) = recording.finish()?;
     analyse(&sound, rate)
+}
+
+/// The louder of two measurements, with every frequency that the quieter one does not bear out marked
+/// uncertain: where the quieter is not clearly above the noise itself, or did not come out `QUIETER`
+/// dB quieter within `STEADY`.
+fn borne_out(mut loud: Measured, quiet: &Measured) -> Measured {
+    loud.off_level = (0..loud.hz.len()).map(|i| (quiet.db[i] + quiet.level) - (loud.db[i] + loud.level) + QUIETER).collect();
+    for i in 0..loud.hz.len() {
+        loud.certain[i] &= quiet.certain[i] && loud.off_level[i].abs() <= STEADY;
+    }
+    loud
+}
+
+/// How long a measurement takes, in seconds.
+pub const TAKES: f64 = 2.0 * (BEFORE + SECONDS + AFTER + 0.7);
+
+/// Measure: the sweep at `level` and once more `QUIETER` dB under it, about half a minute in all.
+/// `play_to` is the device the sound is on its way to the speakers from: the path's source when the
+/// path runs (the sweep then passes the equalizer as music does; `through` is its curve then), else
+/// the speakers themselves.
+pub fn measure(microphone: &Input, play_to: &Output, level: f32, through: Option<&Curve>) -> Result<Measured, String> {
+    let loud = once(microphone, play_to, level)?;
+    let quiet = once(microphone, play_to, level * 10f32.powf(-QUIETER / 20.0))?;
+    let mut m = borne_out(loud, &quiet);
+    if let Some(curve) = through {
+        m.eq = m.hz.iter().map(|hz| curve.response_db(play_to.rate as f64, *hz as f64)).collect();
+    }
+    Ok(m)
 }
 
 #[cfg(test)]
@@ -278,6 +319,29 @@ mod tests {
                 assert!((m.db[i] - want[i]).abs() < 1.0, "at {} Hz: measured {} dB, the curve is {} dB", m.hz[i], m.db[i], want[i]);
             }
         }
+    }
+
+    #[test]
+    fn what_changes_with_the_level_is_marked_uncertain() {
+        // speakers that give no bass at all once the sound is quieter: the quieter sweep has a slope
+        // at 150 Hz that the louder has not
+        let gated = Settings::default();
+        let cut = Point { kind: Some(Kind::LowCut), q: CUT_Q, ..Point::new(150.0, 0.0) };
+        gated.set_points(&[cut, cut]);
+        let quieter = 10f32.powf(-QUIETER / 20.0);
+        let loud = analyse(&recorded(48000, 0.0005, |_| {}), 48000).unwrap();
+        let mut way = through(&gated, 48000);
+        let quiet = analyse(&recorded(48000, 0.0005, |block| { block.iter_mut().for_each(|s| *s *= quieter); way(block) }), 48000).unwrap();
+        assert!(loud.at(60.0).1, "alone, the louder sweep is believed at 60 Hz");
+        let m = borne_out(loud, &quiet);
+        assert!(!m.at(60.0).1 && !m.at(100.0).1, "60 Hz is {:?}, 100 Hz is {:?}", m.at(60.0), m.at(100.0));
+        assert!(m.at(1000.0).1 && m.at(5000.0).1);
+        let i = (0..m.hz.len()).find(|i| m.hz[*i] >= 1000.0).unwrap();
+        assert!(m.off_level[i].abs() < 0.3 && m.off_level[(0..m.hz.len()).find(|i| m.hz[*i] >= 60.0).unwrap()] < -10.0);
+        // and the same sound twice is borne out everywhere it was believed
+        let (a, b) = (analyse(&recorded(48000, 0.0005, |_| {}), 48000).unwrap(), analyse(&recorded(48000, 0.0005, |block| block.iter_mut().for_each(|s| *s *= quieter)), 48000).unwrap());
+        let share = a.share();
+        assert!(borne_out(a, &b).share() > share - 0.05);
     }
 
     #[test]

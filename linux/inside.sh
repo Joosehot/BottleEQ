@@ -23,6 +23,9 @@ sleep 1
 $B devices
 $B measure --mic mic --to speakers --keep test/linux/measured_flat.csv | tail -3
 $B measure --mic mic --to speakers --gains 6,0,-4,0,3,-6,0,4,0,-3 --keep test/linux/measured_bands.csv | tail -3
+echo "== correcting: the way is flat here, so whatever the equalizer is set to while measuring, the correction must be nothing"
+$B measure --mic mic --to speakers --gains 0,0,5,2,0,-1,0,0,-3,-6 --correct --keep test/linux/correct.csv | grep -E "believed|the correction|bands|points|From flat|kept"
+$B calibrations
 echo "== the window"
 Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 &
 sleep 1

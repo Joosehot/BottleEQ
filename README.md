@@ -134,10 +134,11 @@ Not done: nobody has heard it.
 
 ## Measure and calibrate
 
-Three stages; the first is made.
+Three stages; the first two are made.
 
 1. **Measurement** (done): what reaches the listening place is measured with a microphone.
-2. Correction: the measured curve turned over into the equalizer's curve, kept as named calibrations.
+2. **Correction** (done): the measured curve turned over into the equalizer's curve, kept as named
+   calibrations.
 3. Guesser: a whole correction guessed from a short, noisy sample and the kind of device.
 
 ### Stage 1: measuring
@@ -145,10 +146,13 @@ Three stages; the first is made.
 ![A measurement in the window](docs/window-measured.png)
 
 In the window: choose the microphone, put it where you listen, press **Measure**. A sine rises from
-20 Hz to 20 kHz in ten seconds out of the speakers (loud; about 15 seconds in all with the silence
-recorded before and after) while the microphone records. The blue line is what reached it, on the
-curve's own scale, against its own average between 200 Hz and 5 kHz. Where a frequency is not at least
-10 dB above the room's noise the line is dotted. Measure again at any time; the line is the last one.
+20 Hz to 20 kHz in ten seconds out of the speakers (loud) while the microphone records, and then once
+more 10 dB quieter: about half a minute in all. The blue line is what reached the microphone, on the
+curve's own scale, against its own average between 200 Hz and 5 kHz. Where a frequency is not to be
+believed the line is dotted: where it is not at least 10 dB above the room's noise, or where it did not
+come out 10 dB quieter (within 3 dB) in the quieter sweep. Speakers and a room answer the same at any
+level; what does not is not theirs alone, and no equalizer sets it right. Measure again at any time;
+the line is the last one.
 From the keyboard: `bottle-eq measure --mic <microphone> --to <speakers> [--from <source>] [--keep file.csv]`.
 
 While the path runs the sweep is played to its source, so it passes the equalizer as music does: the
@@ -187,8 +191,64 @@ Measured (2026-11-21):
     within about 1 dB). So down there the line is not one curve that an equalizer could turn over, and
     being above the noise does not show it.
 
-Not done: no check yet that marks such frequencies (measuring at two levels would); nobody but the
-program's own test has pressed Measure in the window.
+    The second, quieter sweep was added for this: such frequencies are now marked as not to be believed
+    (with it, 73% of the frequencies are believed, against 86% by the noise alone).
+
+Not done: nobody but the program's own test has pressed Measure in the window.
+
+### Stage 2: correcting
+
+![Measured, corrected and measured again](docs/window-corrected.png)
+
+**Correct** turns the last measurement over into the equalizer's curve (`src/calibrate.rs`), so that what
+reaches the microphone becomes flat. In the picture: the faint blue line is what was measured before,
+the amber curve the correction, the white dashes at 0 dB the flat that is aimed at, and the bright blue
+line what was measured again through the correction.
+
+- **What is set right** is the speakers and the room alone: the measurement less the equalizer's curve
+  the sweep went through. So it can be corrected again from any later measurement.
+- **What is wanted** is that turned over, read a third of an octave wide (a narrow dip is a place in the
+  room; a hand's width away it is elsewhere). Nothing is raised more than 6 dB (a deep hole is sound
+  that cancels itself: more of it cancels as much), nothing lowered more than 12.
+- **Nothing is done** where the measurement is not to be believed, nor past the ends of what the
+  speakers can do (where the level lies more than 10 dB under the rest); toward those ends what is
+  wanted fades out over a third of an octave, so a falling edge is not propped up.
+- **The curve** is made of what the equalizer has: the ten bands' gains, then up to eight points put
+  where the most is still missing, each number tried in turn until the curve lies on what is wanted. It
+  takes half a second.
+
+**Save** keeps the curve under a name ("Speakers", "Headphones") with the devices, the day and the
+measurement it was made from: a file in the folder `calibrations` where Bottle EQ is run from. The list
+beside it sets one that was kept; so does `--calibration <name>` for `run` and the window.
+
+```
+bottle-eq measure --mic <mic> --from <source> --to <speakers> --correct --save Speakers
+bottle-eq calibrations
+bottle-eq run --from <source> --to <speakers> --calibration speakers
+bottle-eq correct --keep measurement.csv      # the correction a kept measurement asks for (nothing is played)
+```
+
+Measured (2026-11-21):
+
+- `cargo test`: speakers with a hump in the bass, a dip in the middle and a falling treble come out
+  flat within 0.6 dB (from over 2.5 dB); nothing is done where the measurement is not believed, a hole
+  20 dB deep is raised by 6 dB at the most, and speakers with nothing above 9 kHz are left alone there;
+  the equalizer the sweep went through is taken off; a calibration is read back as it was written.
+- On Linux (`linux/test.sh`, the microphone that hears exactly what the speakers are given): the way is
+  flat there, and measured through ten bands set to anything the correction comes out as nothing (every
+  band within 0.2 dB of 0, no point): the equalizer the sweep went through is taken off.
+- In the room (the USB speakers, the USB microphone, through the path): measured, corrected, measured
+  again. Within reach were 157 frequencies from 85 Hz to 7.7 kHz. The correction: bands
+  `-0.2 +0.5 -1.5 -3.0 -2.4 -0.6 +5.7 -1.0 -0.2 0` and eight points; the curve lies 0.57 dB from what
+  was wanted (1.41 dB at the most). **From flat: 3.90 dB before, 1.76 dB after** (the usual distance of
+  the level from its mean, over the 155 frequencies within reach and believed both times). Done again
+  from the window: 4.0 dB before, 1.8 dB after.
+  What is left is mostly what was not asked for: the narrow dips and peaks inside a third of an
+  octave, and the dip at 1.6 to 2 kHz, which is deeper than the 6 dB it may be raised by.
+
+Not done: nobody has listened to it. Only these speakers and this microphone were tried, at one place
+in the room; headphones cannot be measured this way (a microphone in the room does not hear what an ear
+inside them does). The microphone's own response is turned over along with the speakers'.
 
 ## On Linux
 
