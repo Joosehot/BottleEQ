@@ -347,9 +347,12 @@ impl Window {
                 self.settings.set_points(&first_points());
                 self.mode = "Flat".to_string();
             }
-            let mut on = self.settings.on.load(Ordering::Relaxed);
-            if ui.checkbox(&mut on, "on").on_hover_text("Off: the sound passes untouched whatever is set, to hear the difference.").changed() {
-                self.settings.on.store(on, Ordering::Relaxed);
+            // on or bypassed, as one button that says which: to hear the difference
+            let on = self.settings.on.load(Ordering::Relaxed);
+            let (text, fill) = if on { ("EQ ON", Color32::from_rgb(40, 110, 70)) } else { ("BYPASSED", Color32::from_rgb(150, 50, 45)) };
+            let bypass = egui::Button::new(egui::RichText::new(text).strong().color(Color32::WHITE)).fill(fill).min_size(egui::vec2(84.0, 0.0));
+            if ui.add(bypass).on_hover_text("Press to compare. BYPASSED: the sound passes untouched, whatever curve and calibration are set.").clicked() {
+                self.settings.on.store(!on, Ordering::Relaxed);
             }
             ui.label("Volume");
             let mut volume = self.settings.volume();
@@ -398,6 +401,10 @@ impl Window {
                     "Ticked: the correction is the mirror image of the measured curve as it was measured, raised as much as 12 dB, with as many as 24 points. Flattest at the place that was measured; it asks more of the speakers and takes more headroom.\nUnticked: the careful way: read a third of an octave wide, raised 6 dB at the most, faded toward the ends of what the speakers can do, 8 points. It holds better a step to the side.",
                 );
             });
+            // a camera's microphone is warned of as soon as it is chosen
+            if let Some(warning) = self.mic.and_then(|i| measure::camera_said(&self.inputs[i].name)) {
+                ui.label(egui::RichText::new("⚠ camera microphone").color(Color32::from_rgb(255, 120, 90))).on_hover_text(warning);
+            }
             let text = match &self.measuring {
                 Some((_, began, short)) => format!("measuring: keep quiet ... {:.0} s", (if *short { measure::SHORT_TAKES } else { measure::TAKES } - began.elapsed().as_secs_f64()).max(0.0)),
                 None => self.measure_said.clone(),
@@ -555,7 +562,8 @@ impl Window {
                     _ => String::new(),
                 };
                 let levels = m.levels_said().map_or(String::new(), |said| format!("\nNOTE: {said}"));
-                self.measure_said = format!("measured: {:.0}% to be believed{flat}{clipped}{levels}", 100.0 * m.share());
+                let camera = self.mic.and_then(|i| measure::camera_said(&self.inputs[i].name)).map_or(String::new(), |said| format!("\nWARNING: {said}"));
+                self.measure_said = format!("measured: {:.0}% to be believed{flat}{clipped}{levels}{camera}", 100.0 * m.share());
                 (self.measured, self.measuring) = (Some(m), None);
                 if self.correct_soon {
                     self.correct_soon = false;

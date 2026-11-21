@@ -59,6 +59,13 @@ fn sweep_at(t: f64) -> f64 {
     phase.sin() * fade(t / 0.1) * fade((SECONDS - t) / 0.01)
 }
 
+/// A warning for a microphone that by its name is a camera's: such a one shapes and cleans what it
+/// hears for speech, and a measurement made with it is of the microphone, not of the speakers.
+pub fn camera_said(microphone: &str) -> Option<String> {
+    let name = microphone.to_lowercase();
+    ["webcam", "camera"].iter().any(|word| name.contains(word)).then(|| format!("\"{microphone}\" looks like a camera's microphone: it spoils the measurement. Use a separate microphone (a cheap USB one will do)."))
+}
+
 /// The sweep as samples (one channel).
 pub fn sweep(rate: u32, level: f32) -> Vec<f32> {
     (0..(SECONDS * rate as f64) as usize).map(|i| level * sweep_at(i as f64 / rate as f64) as f32).collect()
@@ -373,6 +380,13 @@ mod tests {
         let m = borne_out(a, &b);
         assert!(m.share() > share - 0.05);
         assert!(m.second_off.abs() < 0.3 && m.levels_said().is_none());
+    }
+
+    #[test]
+    fn a_camera_s_microphone_is_warned_of_by_its_name() {
+        assert!(camera_said("HD Pro Webcam C920").is_some());
+        assert!(camera_said("Microphone (USB Camera)").is_some());
+        assert!(camera_said("Microphone (USB PnP Audio Device)").is_none());
     }
 
     #[test]

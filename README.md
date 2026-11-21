@@ -1,15 +1,27 @@
 # Bottle EQ
 
-A system-wide audio equalizer for Windows and Linux with a live visualizer, in Rust. Built in five steps; all five
-are made, and so is measuring and correcting with a microphone. Its owner has listened to it on
-Windows (2026-11-21); on Linux nobody has.
+Free, open-source speaker calibration and EQ for Windows and Linux. Make your speakers sound better for zero money.
 
-1. **Audio capture** (done): what Windows plays is captured by WASAPI loopback and played back out,
-   5.8 ms later.
-2. **EQ engine** (done): ten bands, 20 modes, and points as in FL Studio's parametric EQ.
-3. **"Flat" button** (done), with a hook for per-device correction curves (`modes.txt`).
-4. **Visualizer** (done): an always-on-top window with the live spectrum and the EQ curve on one graph.
-5. **Draggable curve** (done): the bands and the points are dragged with the mouse.
+## Features
+- **Calibrate:** measure your speakers with a mic, Bottle EQ corrects them toward flat.
+- **EQ:** shape the sound yourself, like a bass boost.
+- **Compare:** toggle on/off to hear the difference.
+
+## Mic tips
+- Use a decent mic (a cheap USB mic is fine).
+- Don't use webcam or laptop mics, they ruin the measurement.
+- Put the mic where your head is.
+
+Not a replacement for pro studio calibration gear.
+
+## Build
+
+```
+cargo build --release        # Rust; on Linux first: sudo apt install libpipewire-0.3-dev libclang-dev pkg-config
+target/release/bottle-eq     # the window (on Linux: bottle-eq window --to <speakers>)
+```
+
+MIT licence (`LICENSE`).
 
 ## The window
 
@@ -35,8 +47,8 @@ One graph, from 20 Hz to 20 kHz on a logarithmic axis:
 
 The sound changes while a handle is dragged: every move goes to the audio thread at once, which slides
 to it without a click. **Mode** sets the ten bands; **Flat** puts every band at 0 dB and the points back
-where they began (three of them at 0 dB): the sound then passes bit for bit as it came. **on** unticked
-lets the sound pass untouched whatever is set, to hear the difference. The line at the bottom is the
+where they began (three of them at 0 dB): the sound then passes bit for bit as it came. The button **EQ ON /
+BYPASSED** lets the sound pass untouched whatever curve and calibration are set, to hear the difference. The line at the bottom is the
 delay, how far the sound is turned down for headroom, and the gaps so far.
 
 **Volume** (the slider, or `--volume <dB>`) is a gain on the whole sound after the equalizer, from -30

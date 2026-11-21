@@ -455,6 +455,9 @@ fn main() {
         Some(command @ ("measure" | "guess")) => {
             let guessing = command == "guess";
             let mic = audio::find_input(&mic_text.unwrap_or_else(|| fail("give --mic <microphone> (see `bottle-eq devices`)"))).unwrap_or_else(|e| fail(&e));
+            if let Some(warning) = measure::camera_said(&mic.name) {
+                println!("WARNING: {warning}");
+            }
             let target = find(&to.clone().unwrap_or_else(|| fail("give --to <device>: the speakers the sweep is played out of"))).unwrap_or_else(|e| fail(&e));
             // with a source the sweep is played to it and goes through the path and the equalizer as
             // music does; without, straight to the speakers
