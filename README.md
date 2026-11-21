@@ -39,6 +39,16 @@ where they began (three of them at 0 dB): the sound then passes bit for bit as i
 lets the sound pass untouched whatever is set, to hear the difference. The line at the bottom is the
 delay, how far the sound is turned down for headroom, and the gaps so far.
 
+**Volume** (the slider, or `--volume <dB>`) is a gain on the whole sound after the equalizer, from -30
+to +18 dB. Above 0 dB it gives back what the headroom took (a correction that raises 6 dB somewhere
+turns the whole sound down 6 dB first), and more. A sound at full height would then no longer fit, so a
+limiter stands after it: the moment a frame would go over full scale the whole sound is turned down just
+enough, at once, and let back up over a sixth of a second. Nothing clips; the loudest moments are held
+back instead, and the bottom line says by how much. Checked: a quiet sine comes out 6 dB louder at +6;
+a sine at full height at +12 never goes over full scale and stays a sine; back at 0 the sound passes
+exactly as it came. In the running path, pink noise at full level with +12: captured loudest sample
+1.098, handed to the target 1.0000, level up from -13.1 to -8.4 dB (the limiter took the rest).
+
 Crates: `windows` (the audio), `rustfft` (the spectrum), `eframe`/egui (the window).
 
 Checked:

@@ -28,6 +28,7 @@
 //!   --gains <ten numbers>    the ten bands' gains in dB, low to high, e.g. --gains 4,2,0,0,0,0,0,0,2,4
 //!   --mode <name>            a mode from modes.txt, e.g. --mode "bass boost"
 //!   --calibration <name>     a calibration kept (its bands and points), e.g. --calibration speakers
+//!   --volume <dB>            the whole sound louder (up to +18) or quieter; a limiter keeps it from clipping
 //!   --points <points>        points on top of the bands, as in FL Studio's EQ: each a filter of its own,
 //!                            e.g. --points "100:cut 1k:-2 12k:+8:spike" (a slope at the start, a dip, a
 //!                            spike at the end); see `points_of` for how a point is written
@@ -256,7 +257,7 @@ fn show_gains(gains: &Settings, rate: u32) {
         println!("points:     {}", points.join(" | "));
     }
     match gains.on.load(Ordering::Relaxed) {
-        true => println!("            turned down {:.1} dB for headroom", -set.headroom(rate as f64)),
+        true => println!("            turned down {:.1} dB for headroom{}", -set.headroom(rate as f64), if gains.volume() != 0.0 { format!("; volume {:+.1} dB", gains.volume()) } else { String::new() }),
         false => println!("            off: the sound passes untouched"),
     }
 }
@@ -300,6 +301,7 @@ fn main() {
     let level = level_given.unwrap_or(1.0);
     let (mic_text, keep_text) = (take("--mic"), take("--keep"));
     let (calibration_text, save_text) = (take("--calibration"), take("--save"));
+    let volume: f32 = take("--volume").map(|s| s.parse().unwrap_or_else(|_| fail("--volume takes a number of dB, like +6"))).unwrap_or(0.0);
     let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
     let (shot, drag) = (take("--shot"), take("--drag"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
@@ -312,6 +314,7 @@ fn main() {
     };
     let (exclusive, shared, measure_flag, correct) = (flag("--exclusive"), flag("--shared"), flag("--measure"), flag("--correct"));
     let gains = Arc::new(Settings::default());
+    gains.set_volume(volume);
     let given = gains_text.map(|g| parse_gains(&g));
     given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
     // a mode is a named set of the ten bands' gains; points are filters of their own on top
@@ -529,6 +532,7 @@ fn main() {
                         Ok(points) => g.set_points(&points),
                         Err(e) => println!("{e}"),
                     },
+                    ["volume", db] if db.parse::<f32>().is_ok() => g.set_volume(db.parse().unwrap_or(0.0)),
                     ["flat"] => g.flat(),
                     ["off"] => g.on.store(false, Ordering::Relaxed),
                     ["on"] => g.on.store(true, Ordering::Relaxed),

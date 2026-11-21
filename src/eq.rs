@@ -27,6 +27,12 @@
 //!
 //! So that a raised curve cannot clip, the whole sound is turned down by the curve's highest point
 //! (`headroom`).
+//!
+//! **Volume** is a gain on the whole sound after that, from -40 to +18 dB. Turned up it can give back
+//! what the headroom took, and more; then a sound at full height would no longer fit, so a limiter
+//! stands after it: the moment a frame would go over full scale the whole sound is turned down just
+//! enough (at once, all channels alike), and let back up over a sixth of a second. Nothing ever clips;
+//! what it costs is that the loudest moments are held back, which is said (`Settings::limited`).
 
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -42,6 +48,11 @@ pub const POINT_Q: f32 = 0.9;
 pub const CUT_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// the furthest a gain can be set, in dB
 pub const MOST: f32 = 12.0;
+/// the volume's ends, in dB
+pub const QUIETEST: f32 = -40.0;
+pub const LOUDEST: f32 = 18.0;
+/// how long the limiter takes to let the sound back up, in seconds
+const LET_UP: f64 = 0.16;
 /// how far a gain moves in one block, in dB (a block is about 3 ms), and a frequency, as a ratio
 const STEP: f32 = 0.25;
 const SLIDE: f32 = 1.06;
@@ -221,6 +232,9 @@ pub struct Settings {
     count: AtomicUsize,
     /// false: the sound passes untouched whatever is set
     pub on: AtomicBool,
+    /// the volume in dB, and the most the limiter held the sound back since it was last asked, in dB
+    volume: AtomicU32,
+    limited: AtomicU32,
 }
 
 impl Default for Settings {
@@ -230,6 +244,8 @@ impl Default for Settings {
             points: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
             count: AtomicUsize::new(0),
             on: AtomicBool::new(true),
+            volume: AtomicU32::new(0f32.to_bits()),
+            limited: AtomicU32::new(0f32.to_bits()),
         }
     }
 }
@@ -239,6 +255,20 @@ const KINDS: [Kind; 5] = [Kind::LowCut, Kind::LowShelf, Kind::Peak, Kind::HighSh
 impl Settings {
     pub fn set(&self, band: usize, db: f32) {
         self.gains[band].store(db.clamp(-MOST, MOST).to_bits(), Ordering::Relaxed);
+    }
+
+    /// The volume in dB: 0 leaves the sound's level as it is.
+    pub fn set_volume(&self, db: f32) {
+        self.volume.store(db.clamp(QUIETEST, LOUDEST).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
+    /// The most the limiter held the sound back since this was last asked, in dB (0: it did not).
+    pub fn limited(&self) -> f32 {
+        f32::from_bits(self.limited.swap(0f32.to_bits(), Ordering::Relaxed))
     }
 
     pub fn set_all(&self, gains: &[f32; BANDS]) {
@@ -300,10 +330,13 @@ pub struct Eq {
     rate: f64,
     /// the ten bands, then the points
     filters: [Filter; BANDS + POINTS],
-    /// the whole sound's gain now, in dB (the headroom, on its way), and the headroom of the curve last seen
+    /// the whole sound's gain now, in dB (the headroom and the volume, on their way), and the headroom
+    /// of the curve last seen
     level: f32,
     seen: Curve,
     room: f32,
+    /// the limiter: what the sound is held back to now (1: not at all)
+    held: f64,
     /// memory[channel][filter]
     memory: Vec<[Memory; BANDS + POINTS]>,
 }
@@ -315,7 +348,7 @@ impl Eq {
             let (kind, hz, q) = if i < BANDS { (band_kind(i), CENTRES[i], BAND_Q) } else { (Kind::Peak, 1000.0, POINT_Q) };
             Filter { kind, hz, db: 0.0, q, coef: coef(kind, hz, 0.0, q, rate), live: false }
         });
-        Eq { rate, filters, level: 0.0, seen: Curve::default(), room: 0.0, memory: Vec::new() }
+        Eq { rate, filters, level: 0.0, seen: Curve::default(), room: 0.0, held: 1.0, memory: Vec::new() }
     }
 
     /// One block of interleaved frames, equalized in place toward the curve set.
@@ -359,8 +392,10 @@ impl Eq {
             (self.seen, self.room) = (set, set.headroom(self.rate));
         }
         let level_before = self.level;
-        self.level += (self.room - self.level).clamp(-STEP, STEP);
-        if self.filters.iter().all(|f| !f.live) && self.level == 0.0 && level_before == 0.0 {
+        // the volume moves four times as fast as a curve's gain: it is a knob that is turned
+        let aim = self.room + settings.volume();
+        self.level += (aim - self.level).clamp(-4.0 * STEP, 4.0 * STEP);
+        if self.filters.iter().all(|f| !f.live) && self.level == 0.0 && level_before == 0.0 && self.held == 1.0 {
             return; // flat: the sound is left exactly as it came
         }
 
@@ -378,6 +413,29 @@ impl Eq {
                 }
                 // the level slides across the block
                 frame[c] = (s * (from + (to - from) * (i + 1) as f64 / frames as f64)) as f32;
+            }
+        }
+        // the limiter, when the volume is up over what the headroom allows (or it is still letting up)
+        if self.level.max(level_before) > self.room || self.held < 1.0 {
+            let up = 1.0 - (-1.0 / (LET_UP * self.rate)).exp();
+            let mut least = 1.0f64;
+            for frame in sound.chunks_mut(channels) {
+                let peak = frame.iter().fold(0.0f32, |p, s| p.max(s.abs())) as f64;
+                self.held += (1.0 - self.held) * up;
+                if peak * self.held > 1.0 {
+                    self.held = 1.0 / peak;
+                }
+                least = least.min(self.held);
+                if self.held < 1.0 {
+                    frame.iter_mut().for_each(|s| *s = (*s as f64 * self.held) as f32);
+                }
+            }
+            if self.held > 0.999 {
+                self.held = 1.0;
+            }
+            let back = (-20.0 * least.log10()) as f32;
+            if back > 0.01 && back > f32::from_bits(settings.limited.load(Ordering::Relaxed)) {
+                settings.limited.store(back.to_bits(), Ordering::Relaxed);
             }
         }
     }
@@ -530,6 +588,34 @@ mod tests {
             let peak = sound[RATE as usize..].iter().fold(0.0f32, |p, s| p.max(s.abs()));
             assert!(peak <= 1.002 && peak > 0.99, "peak {peak} at {hz} Hz");
         }
+    }
+
+    #[test]
+    fn the_volume_raises_the_sound_and_the_limiter_keeps_it_from_clipping() {
+        // a quiet sine, 6 dB up: 6 dB louder, and the limiter has nothing to do
+        let settings = Settings::default();
+        settings.set_volume(6.0);
+        let mut eq = Eq::new(RATE);
+        let mut quiet = sine(1000.0, 1.0);
+        let before = rms(&quiet[24000..]);
+        quiet.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
+        assert!((20.0 * (rms(&quiet[24000..]) / before).log10() - 6.0).abs() < 0.01);
+        assert_eq!(settings.limited(), 0.0);
+        // a sine at full height, 12 dB up: no sample goes over, and it is said how far it was held back
+        settings.set_volume(12.0);
+        let mut loud: Vec<f32> = sine(1000.0, 1.0).iter().map(|s| 4.0 * s).collect();
+        loud.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
+        assert!(loud.iter().all(|s| s.abs() <= 1.0), "the loudest sample is {}", loud.iter().fold(0.0f32, |p, s| p.max(s.abs())));
+        let held = settings.limited();
+        assert!((held - 12.0).abs() < 0.5 && settings.limited() == 0.0, "held back {held} dB");
+        // and still a sine: held back evenly, not cut off at the top
+        let top = loud[24000..].iter().fold(0.0f32, |p, s| p.max(s.abs()));
+        assert!(top > 0.9 && (rms(&loud[24000..]) / top as f64 - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.02, "top {top}, rms {}", rms(&loud[24000..]));
+        // back at 0 the sound passes exactly as it came again, once the limiter has let up
+        settings.set_volume(0.0);
+        let mut again = sine(440.0, 3.0);
+        again.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
+        assert!(again[96000..] == sine(440.0, 3.0)[96000..], "two seconds after the volume is back at 0 the sound is not yet as it came");
     }
 
     #[test]

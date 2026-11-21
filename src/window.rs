@@ -170,6 +170,8 @@ struct Window {
     /// what the path says of itself, looked at twice a second
     looked: Instant,
     looks: u32,
+    /// the most the limiter held the sound back in the last second or so, in dB
+    limited: f32,
     delay: (f32, f32),
     said: String,
     // trying it out
@@ -325,6 +327,17 @@ impl Window {
             let mut on = self.settings.on.load(Ordering::Relaxed);
             if ui.checkbox(&mut on, "on").on_hover_text("Off: the sound passes untouched whatever is set, to hear the difference.").changed() {
                 self.settings.on.store(on, Ordering::Relaxed);
+            }
+            ui.label("Volume");
+            let mut volume = self.settings.volume();
+            let slider = egui::Slider::new(&mut volume, -30.0..=eq::LOUDEST).step_by(0.5).custom_formatter(|db, _| format!("{db:+.1} dB")).trailing_fill(true);
+            ui.spacing_mut().slider_width = 110.0;
+            let moved = ui.add(slider).on_hover_text("The whole sound louder or quieter, after the equalizer. Above 0 dB it gives back what the headroom took, and more; a limiter then holds the loudest moments back so that nothing clips.\nDouble click: back to 0 dB.");
+            if moved.double_clicked() {
+                volume = 0.0;
+            }
+            if moved.changed() || moved.double_clicked() {
+                self.settings.set_volume(volume);
             }
             if ui.checkbox(&mut self.on_top, "stay on top").changed() {
                 let level = if self.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
@@ -494,8 +507,9 @@ impl Window {
             (_, false) => self.said.clone(),
             (Some(r), _) => {
                 let m = &r.meters;
+                let limited = if self.limited > 0.05 { format!("   the limiter holds the loudest moments back {:.1} dB", self.limited) } else { String::new() };
                 format!(
-                    "delay {:.1} ms (longest {:.1})   turned down {:.1} dB for headroom   gaps {}",
+                    "delay {:.1} ms (longest {:.1})   turned down {:.1} dB for headroom   gaps {}{limited}",
                     self.delay.0,
                     self.delay.1,
                     if self.settings.on.load(Ordering::Relaxed) { -self.settings.get().headroom(self.rate()) } else { 0.0 },
@@ -780,6 +794,8 @@ impl eframe::App for Window {
             if let Some(running) = &self.running {
                 self.delay = running.delay();
             }
+            // what the limiter did since the last look; shown falling away over a few looks
+            self.limited = self.settings.limited().max(self.limited - 1.0).max(0.0);
             // every two seconds: which device Windows plays to now (asked in a thread of its own, as in `open`)
             self.looks += 1;
             if self.looks % 4 == 0 {
@@ -859,6 +875,7 @@ pub fn open(start: Start) -> Result<(), String> {
         graph: Rect::ZERO,
         looked: Instant::now(),
         looks: 0,
+        limited: 0.0,
         delay: (0.0, 0.0),
         said: String::new(),
         opened: Instant::now(),
@@ -884,7 +901,7 @@ pub fn open(start: Start) -> Result<(), String> {
         window.start();
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([720.0, 480.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
+        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([760.0, 480.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
         ..Default::default()
     };
     eframe::run_native("Bottle EQ", options, Box::new(move |made| {
