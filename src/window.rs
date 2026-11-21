@@ -18,6 +18,9 @@
 //!   line what was measured before it, the white dashes at 0 dB the flat that is aimed at. Measure
 //!   again to see how near it came. **Save** keeps the curve as a calibration by name; the list beside
 //!   it sets one that was kept.
+//! - **Quick guess** measures with one sweep only, fills in what that leaves open from what curves of
+//!   the same kind of device look like (`guess.rs`), and corrects at once. What was guessed is drawn
+//!   in violet dashes, apart from the blue that was measured. Measure again to see how near flat it came.
 //!
 //! The sound changes while a handle is dragged: the curve goes to the audio thread through `Settings`
 //! (atomics) at every move, and the audio thread slides to it. The audio thread never waits for the
@@ -32,6 +35,7 @@ use crate::ring::Ring;
 use crate::spectrum::{Spectrum, SIZE};
 use crate::audio::{self, run, Input, Output, Running};
 use crate::calibrate::{self, Calibration};
+use crate::guess;
 use crate::measure::{self, Measured};
 
 /// the graph's edges: frequencies, the curve's dB each way, the spectrum's lowest level
@@ -47,6 +51,7 @@ const SPIKE_Q: f32 = 6.0;
 const AMBER: Color32 = Color32::from_rgb(255, 190, 80);
 const GREEN: Color32 = Color32::from_rgb(70, 190, 130);
 const BLUE: Color32 = Color32::from_rgb(110, 175, 255);
+const VIOLET: Color32 = Color32::from_rgb(205, 140, 255);
 /// how loud the sweep is sent, of the most there is
 const SWEEP: f32 = 0.5;
 
@@ -69,6 +74,9 @@ pub struct Start {
     pub measure: bool,
     /// and then correct and measure again, by itself
     pub correct: bool,
+    /// the first measurement is a quick guess; and the kind of device
+    pub guess: bool,
+    pub kind: String,
 }
 
 /// The points a curve starts from: one at each end and one between (each between two bands), all at 0 dB.
@@ -184,13 +192,19 @@ struct Window {
     // measuring
     inputs: Vec<Input>,
     mic: Option<usize>,
-    /// a measurement under way: where its result comes, and when it began
-    measuring: Option<(std::sync::mpsc::Receiver<Result<Measured, String>>, Instant)>,
+    /// a measurement under way: where its result comes, when it began, and whether it is the short one
+    /// that a guess is made from
+    measuring: Option<(std::sync::mpsc::Receiver<Result<Measured, String>>, Instant, bool)>,
     measured: Option<Measured>,
     measure_said: String,
     measure_shown: String,
     measure_soon: Option<Instant>,
     correct_soon: bool,
+    guess_soon: bool,
+    /// the kind of device: what the guesser learns from, and what a calibration is kept as
+    kind: String,
+    /// the frequencies of `before` that were measured and believed (not guessed)
+    before_measured: Vec<bool>,
     // calibrating
     /// what the correction that is set was made from: frequencies, the speakers and the room alone,
     /// and which of them are within reach
@@ -357,7 +371,13 @@ impl Window {
                     "Plays a sweep from 20 Hz to 20 kHz out of the speakers (about 15 seconds, loud) and records it with the microphone: put the microphone where you listen, and pause the music first.\nThe blue line is what reached the microphone: speakers, room and microphone together.",
                 );
                 if button.clicked() {
-                    self.measure();
+                    self.measure(false);
+                }
+                let quick = ui.button("Quick guess").on_hover_text(
+                    "One sweep only (a quarter of a minute). What it leaves open is filled in from what curves of the same kind of device look like, and the correction is set at once.\nViolet dashes: guessed, not measured. Measure again afterwards to see how near flat it came.",
+                );
+                if quick.clicked() {
+                    self.measure(true);
                 }
                 let correct = ui.add_enabled(self.measured.is_some(), egui::Button::new("Correct")).on_hover_text(
                     "Turns the last measurement over into the equalizer's curve, so that what reaches the microphone becomes flat. Nothing is raised more than 6 dB, and nothing is done where the measurement is not to be believed or the speakers have nothing to give.\nThen measure again to see how near flat it came.",
@@ -367,7 +387,7 @@ impl Window {
                 }
             });
             let text = match &self.measuring {
-                Some((_, began)) => format!("measuring: keep quiet ... {:.0} s", (measure::TAKES - began.elapsed().as_secs_f64()).max(0.0)),
+                Some((_, began, short)) => format!("measuring: keep quiet ... {:.0} s", (if *short { measure::SHORT_TAKES } else { measure::TAKES } - began.elapsed().as_secs_f64()).max(0.0)),
                 None => self.measure_said.clone(),
             };
             self.measure_shown = text;
@@ -386,10 +406,18 @@ impl Window {
             if let Some(c) = chosen {
                 c.set(&self.settings);
                 self.mode.clear();
-                self.before = (!c.hz.is_empty()).then(|| (c.hz.clone(), c.raw.clone(), c.certain.clone()));
+                self.before = (!c.hz.is_empty()).then(|| (c.hz.clone(), c.raw.clone(), vec![true; c.hz.len()]));
+                self.before_measured = c.certain.clone();
+                self.kind = c.kind.clone();
                 self.save_as = c.name.clone();
                 self.calibration = c.name;
             }
+            ui.label("kind");
+            egui::ComboBox::from_id_salt("kind").width(96.0).selected_text(self.kind.clone()).show_ui(ui, |ui| {
+                for kind in guess::KINDS {
+                    ui.selectable_value(&mut self.kind, kind.to_string(), kind);
+                }
+            });
             ui.label("keep as");
             ui.add(egui::TextEdit::singleline(&mut self.save_as).desired_width(120.0).hint_text("Speakers"));
             if ui.button("Save").on_hover_text("Keeps the curve that is set, with the measurement it was made from, as a calibration of this name (a file in the folder calibrations).").clicked() {
@@ -417,6 +445,7 @@ impl Window {
         self.calibration.clear();
         let alone = calibrate::raw(m);
         let from_flat = calibrate::spread(&alone, &want.reach);
+        self.before_measured = (0..m.hz.len()).map(|i| m.certain[i] && !m.guessed.get(i).copied().unwrap_or(false)).collect();
         self.before = Some((m.hz.clone(), alone, want.reach));
         let heard = if self.running.is_some() { "measure again to see how near flat it came" } else { "press Start: it is heard, and can be measured, only through the path" };
         self.measure_said = format!("corrected ({from_flat:.1} dB from flat before): {heard}");
@@ -430,9 +459,12 @@ impl Window {
             return;
         }
         let set = self.settings.get();
-        let (hz, raw, certain) = self.before.clone().unwrap_or_default();
+        // what was guessed is not kept as measured: the guesser must not learn from its own guesses
+        let (hz, raw, _) = self.before.clone().unwrap_or_default();
+        let certain = if self.before_measured.len() == hz.len() { self.before_measured.clone() } else { vec![false; hz.len()] };
         let calibration = Calibration {
             name: name.clone(),
+            kind: self.kind.clone(),
             device: self.target.map_or(String::new(), |t| self.outputs[t].name.clone()),
             microphone: self.mic.map_or(String::new(), |i| self.inputs[i].name.clone()),
             day: calibrate::today(),
@@ -454,7 +486,7 @@ impl Window {
 
     /// Begin a measurement: the sweep goes where music goes. While the path runs that is its source,
     /// so the sweep passes the equalizer as it is set; else it is played straight to the speakers.
-    fn measure(&mut self) {
+    fn measure(&mut self, short: bool) {
         let (Some(mic), Some(target)) = (self.mic, self.target) else {
             self.measure_said = "choose a microphone, and the speakers to play to (to)".to_string();
             return;
@@ -468,15 +500,28 @@ impl Window {
         // the curve the sweep goes through: the one set, when the path runs and the equalizer is on
         let through = (self.running.is_some() && self.settings.on.load(Ordering::Relaxed)).then(|| self.settings.get());
         std::thread::spawn(move || {
-            let _ = said.send(measure::measure(&input, &play_to, SWEEP, through.as_ref()));
+            let _ = said.send(match short {
+                true => measure::short(&input, &play_to, SWEEP, through.as_ref()),
+                false => measure::measure(&input, &play_to, SWEEP, through.as_ref()),
+            });
         });
-        self.measuring = Some((heard, Instant::now()));
+        self.measuring = Some((heard, Instant::now(), short));
     }
 
     /// Take a measurement's result when it has come.
     fn measured(&mut self) {
-        let Some((heard, _)) = &self.measuring else { return };
+        let Some((heard, _, short)) = &self.measuring else { return };
+        let short = *short;
         match heard.try_recv() {
+            // the short one: filled in from the kind, and corrected at once
+            Ok(Ok(mut m)) if short => {
+                let curves = guess::training(&self.kind);
+                let (measured, guessed) = guess::fill(&mut m, &guess::learn(&curves));
+                (self.measured, self.measuring) = (Some(m), None);
+                self.correct();
+                let heard = if self.running.is_some() { "measure again to see how near flat it came" } else { "press Start to hear it" };
+                self.measure_said = format!("guessed and corrected: {measured} frequencies measured, {guessed} guessed (violet dashes) from {} curves of {}; {heard}", curves.len(), self.kind);
+            }
             Ok(Ok(m)) => {
                 let clipped = if m.peak >= 0.99 { "; THE MICROPHONE CLIPPED: turn it down and measure again" } else { "" };
                 // against the measurement the correction was made from, at the frequencies within its reach
@@ -597,11 +642,21 @@ impl Window {
             // not held at the graph's edge as the curve is: what is weaker than the graph shows leaves it
             let at = |i: usize| pos2(x_of(graph, m.hz[i]), graph.center().y - m.db[i] / SPAN * graph.height() / 2.0);
             for i in 1..m.hz.len() {
+                let guessed = |i: usize| m.guessed.get(i).copied().unwrap_or(false);
                 match m.certain[i - 1] && m.certain[i] {
+                    // what was guessed: dashes, in a colour of their own
+                    true if guessed(i - 1) || guessed(i) => {
+                        if i % 4 < 2 {
+                            painter.line_segment([at(i - 1), at(i)], Stroke::new(2.0, VIOLET));
+                        }
+                    }
                     true => drop(painter.line_segment([at(i - 1), at(i)], Stroke::new(2.0, BLUE))),
                     false if i % 3 == 0 => drop(painter.line_segment([at(i - 1), at(i)], Stroke::new(1.5, BLUE.gamma_multiply(0.6)))),
                     false => {}
                 }
+            }
+            if m.guessed.iter().any(|g| *g) {
+                painter.text(pos2(graph.left() + 6.0, graph.bottom() - 18.0), egui::Align2::LEFT_BOTTOM, "violet dashes: guessed, not measured", small.clone(), VIOLET);
             }
             painter.text(pos2(graph.left() + 6.0, graph.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, if self.before.is_some() { "blue: measured at the microphone (dotted: not to be believed; faint: before the correction)" } else { "blue: measured at the microphone (dotted: not to be believed)" }, small.clone(), BLUE);
         }
@@ -787,7 +842,8 @@ impl eframe::App for Window {
         self.measured();
         if self.measure_soon.is_some_and(|at| Instant::now() >= at) {
             self.measure_soon = None;
-            self.measure();
+            let short = std::mem::take(&mut self.guess_soon);
+            self.measure(short);
         }
         if self.looked.elapsed().as_secs_f32() > 0.5 {
             self.looked = Instant::now();
@@ -892,6 +948,9 @@ pub fn open(start: Start) -> Result<(), String> {
         measure_shown: String::new(),
         measure_soon: start.measure.then(|| Instant::now() + std::time::Duration::from_secs(1)),
         correct_soon: start.correct,
+        guess_soon: start.guess,
+        kind: start.kind,
+        before_measured: Vec::new(),
         before: None,
         calibrations: calibrate::calibrations(),
         calibration: String::new(),
@@ -901,7 +960,7 @@ pub fn open(start: Start) -> Result<(), String> {
         window.start();
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([760.0, 480.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
+        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([820.0, 490.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
         ..Default::default()
     };
     eframe::run_native("Bottle EQ", options, Box::new(move |made| {

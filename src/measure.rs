@@ -76,6 +76,8 @@ pub struct Measured {
     pub off_level: Vec<f32>,
     /// the equalizer's curve the sweep went through, in dB at each frequency (0 where it did not)
     pub eq: Vec<f32>,
+    /// true where the level was not measured but guessed (`guess.rs`); empty when nothing was
+    pub guessed: Vec<bool>,
     /// how far above the noise each level is, in dB
     pub over_noise: Vec<f32>,
     /// the loudest sample of the recording (1 is the most a recording holds: it clipped)
@@ -192,7 +194,7 @@ pub fn analyse(recording: &[f32], rate: u32) -> Result<Measured, String> {
     let of = if middle.is_empty() { &all } else { &middle };
     let average = of.iter().sum::<f32>() / of.len() as f32;
     let eq = vec![0.0; hz.len()];
-    Ok(Measured { hz: hz.iter().map(|hz| *hz as f32).collect(), db: level.iter().map(|l| l - average).collect(), certain, off_level: Vec::new(), eq, over_noise, peak, arrived: spike as f32 / rate as f32, level: average })
+    Ok(Measured { hz: hz.iter().map(|hz| *hz as f32).collect(), db: level.iter().map(|l| l - average).collect(), certain, off_level: Vec::new(), eq, guessed: Vec::new(), over_noise, peak, arrived: spike as f32 / rate as f32, level: average })
 }
 
 /// One sweep: record the microphone, play the sweep to an output like any program would, and compare.
@@ -217,8 +219,19 @@ fn borne_out(mut loud: Measured, quiet: &Measured) -> Measured {
     loud
 }
 
-/// How long a measurement takes, in seconds.
+/// How long a measurement takes, in seconds, and a short one (one sweep).
 pub const TAKES: f64 = 2.0 * (BEFORE + SECONDS + AFTER + 0.7);
+pub const SHORT_TAKES: f64 = BEFORE + SECONDS + AFTER + 0.7;
+
+/// The short measurement the guesser works from: one sweep at one level, a quarter of a minute. What
+/// changes with the level is not found by it.
+pub fn short(microphone: &Input, play_to: &Output, level: f32, through: Option<&Curve>) -> Result<Measured, String> {
+    let mut m = once(microphone, play_to, level)?;
+    if let Some(curve) = through {
+        m.eq = m.hz.iter().map(|hz| curve.response_db(play_to.rate as f64, *hz as f64)).collect();
+    }
+    Ok(m)
+}
 
 /// Measure: the sweep at `level` and once more `QUIETER` dB under it, about half a minute in all.
 /// `play_to` is the device the sound is on its way to the speakers from: the path's source when the

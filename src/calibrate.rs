@@ -196,6 +196,8 @@ pub fn fit(hz: &[f32], want: &[f32], counts: &[f32], rate: f64) -> Fitted {
 #[derive(Clone)]
 pub struct Calibration {
     pub name: String,
+    /// the kind of device: "speakers" or "headphones" (what the guesser learns it as)
+    pub kind: String,
     /// the speakers (or headphones) and the microphone it was measured with, and the day
     pub device: String,
     pub microphone: String,
@@ -233,13 +235,13 @@ fn file(name: &str) -> String {
 impl Calibration {
     /// As it is written in its file: a line for each thing, `what = it`.
     pub fn written(&self) -> String {
-        let mut out = format!("name = {}\ndevice = {}\nmicrophone = {}\nday = {}\n", self.name, self.device, self.microphone, self.day);
+        let mut out = format!("name = {}\ntype = {}\ndevice = {}\nmicrophone = {}\nday = {}\n", self.name, self.kind, self.device, self.microphone, self.day);
         out += &format!("bands = {}\n", self.gains.iter().map(|g| format!("{g:.2}")).collect::<Vec<_>>().join(" "));
         for (i, p) in self.points.iter().enumerate() {
             let kind = p.kind.or(Some(curve(&self.gains, &self.points).kind(i))).and_then(|k| KINDS.iter().find(|(_, kind)| *kind == k)).map_or("peak", |k| k.0);
             out += &format!("point = {:.1} {:.2} {:.3} {kind}\n", p.hz, p.db, p.q);
         }
-        out += "# the measurement it was made from: frequency (Hz), the speakers and the room alone (dB), certain (1) or not (0)\n";
+        out += "# the measurement it was made from: frequency (Hz), the device and the room alone (dB), measured and believed (1) or not (0)\n";
         for i in 0..self.hz.len() {
             out += &format!("measured = {:.2} {:.2} {}\n", self.hz[i], self.raw[i], self.certain[i] as u8);
         }
@@ -248,7 +250,7 @@ impl Calibration {
 
     /// Read back from what `written` wrote.
     pub fn read(text: &str) -> Result<Calibration, String> {
-        let mut c = Calibration { name: String::new(), device: String::new(), microphone: String::new(), day: String::new(), gains: [0.0; BANDS], points: Vec::new(), hz: Vec::new(), raw: Vec::new(), certain: Vec::new() };
+        let mut c = Calibration { name: String::new(), kind: "speakers".to_string(), device: String::new(), microphone: String::new(), day: String::new(), gains: [0.0; BANDS], points: Vec::new(), hz: Vec::new(), raw: Vec::new(), certain: Vec::new() };
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             let Some((what, it)) = line.split_once('=') else { continue };
@@ -258,6 +260,7 @@ impl Calibration {
             let words: Vec<&str> = it.split_whitespace().collect();
             match what.trim() {
                 "name" => c.name = it.to_string(),
+                "type" => c.kind = it.to_string(),
                 "device" => c.device = it.to_string(),
                 "microphone" => c.microphone = it.to_string(),
                 "day" => c.day = it.to_string(),
@@ -331,7 +334,7 @@ mod tests {
         let db: Vec<f32> = hz.iter().map(|hz| speakers.response_db(48000.0, *hz as f64)).collect();
         let certain: Vec<bool> = hz.iter().map(|hz| *hz >= from).collect();
         let n = hz.len();
-        Measured { hz, db, certain, off_level: Vec::new(), eq: vec![0.0; n], over_noise: vec![40.0; n], peak: 0.5, arrived: 1.2, level: -20.0 }
+        Measured { hz, db, certain, off_level: Vec::new(), eq: vec![0.0; n], guessed: Vec::new(), over_noise: vec![40.0; n], peak: 0.5, arrived: 1.2, level: -20.0 }
     }
 
     /// Speakers with a hump in the bass, a dip in the middle and a falling treble.
@@ -401,9 +404,9 @@ mod tests {
         let m = measured(&speakers(), 60.0);
         let want = wanted(&m);
         let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0);
-        let c = Calibration { name: "Speakers at the desk".to_string(), device: "Speakers (USB2.0 Device)".to_string(), microphone: "Microphone".to_string(), day: today(), gains: fitted.gains, points: fitted.points, hz: m.hz.clone(), raw: raw(&m), certain: m.certain.clone() };
+        let c = Calibration { name: "Speakers at the desk".to_string(), kind: "headphones".to_string(), device: "Speakers (USB2.0 Device)".to_string(), microphone: "Microphone".to_string(), day: today(), gains: fitted.gains, points: fitted.points, hz: m.hz.clone(), raw: raw(&m), certain: m.certain.clone() };
         let back = Calibration::read(&c.written()).unwrap();
-        assert_eq!((back.name.as_str(), back.device.as_str(), back.day.as_str()), (c.name.as_str(), c.device.as_str(), c.day.as_str()));
+        assert_eq!((back.name.as_str(), back.kind.as_str(), back.device.as_str(), back.day.as_str()), (c.name.as_str(), "headphones", c.device.as_str(), c.day.as_str()));
         assert!(back.gains.iter().zip(&c.gains).all(|(a, b)| (a - b).abs() < 0.01));
         assert_eq!(back.points.len(), c.points.len());
         assert!(back.points.iter().zip(&c.points).all(|(a, b)| (a.hz / b.hz - 1.0).abs() < 0.01 && (a.db - b.db).abs() < 0.01 && a.kind == b.kind));

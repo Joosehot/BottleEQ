@@ -145,12 +145,13 @@ Heard by its owner through the window (2026-11-21).
 
 ## Measure and calibrate
 
-Three stages; the first two are made.
+Three stages; all three are made. The third, the guesser, has not yet been tried in the room.
 
 1. **Measurement** (done): what reaches the listening place is measured with a microphone.
 2. **Correction** (done): the measured curve turned over into the equalizer's curve, kept as named
    calibrations.
-3. Guesser: a whole correction guessed from a short, noisy sample and the kind of device.
+3. **Guesser** (made; tried on 147 headphones it did not learn from, not yet in the room): a whole
+   correction guessed from a short, noisy sample and the kind of device.
 
 ### Stage 1: measuring
 
@@ -262,6 +263,76 @@ through the window): "the sound is clean and the change is massive". Not done: o
 in the room; headphones cannot be measured this way (a microphone in the room does not hear what an ear
 inside them does). The microphone's own response is turned over along with the speakers'.
 
+### Stage 3: the guesser
+
+A short measurement (one sweep, a quarter of a minute, perhaps in a noisy room) is believed at some
+frequencies and not at others. The guesser (`src/guess.rs`) fills in the others from what curves of the
+same kind of device look like, and the correction is made from the whole curve at once.
+
+- **What it learns from**: curves kept in `training/<kind>/`, brought in with
+  `bottle-eq import <file or folder> --type <kind>` (AutoEq's result files, of which the column "error"
+  is taken: how far from its target the device is; or any table of frequency and dB), and the
+  measurements of the calibrations kept for that kind, at the frequencies that were measured and
+  believed there. The kinds are `speakers` and `headphones`.
+- **What it learns**: the kind's average curve, the (up to eight) ways its curves most differ from the
+  average, and how hard a guess should be held to the average: some of the kind's own curves are hidden
+  in part and guessed with each of a row of holds, and the best is kept.
+- **How it guesses**: the average, moved up or down as a whole and along those ways as far as the
+  measured frequencies ask for, held back toward the average. So that it meets what was measured
+  without a step, what the measured part still differs by at its edge is carried on into the guessed
+  part and fades to half every half octave.
+- **What is guessed is said**: in the window in violet dashes, apart from the blue that was measured; in
+  the table from the keyboard by the word. A calibration saved from a guess keeps only what was measured
+  as measured, so the guesser never learns from its own guesses.
+- A frequency at which no curve of the kind was ever believed is guessed even if one sweep hears it
+  above the noise: one sweep cannot tell what changes with the level (small speakers' lowest bass).
+
+In the window: **Quick guess** (one sweep, the correction set at once), then **Measure again** (the whole
+measurement, through the correction) to see how near flat it came, and **Correct** to do it over from
+that. From the keyboard:
+
+```
+bottle-eq import <AutoEq's results folder> --type headphones
+bottle-eq training --test                  # what there is to learn from, and how well it guesses
+bottle-eq guess --mic <mic> --from <source> --to <speakers> [--type speakers] [--save <name>]
+bottle-eq guess --type headphones --like "WH-1000XM4" --save "WH-1000XM4"   # by name, nothing measured
+```
+
+The last is for what cannot be measured here at all: headphones (a microphone in the room does not
+hear what an ear inside them does). The curve of that model from the training set is taken as it is;
+the correction then aims at the target its measurer used (for AutoEq's files a Harman curve), not at
+flat, and holds only as far as this pair is like the one that was measured.
+
+Measured (2026-11-21):
+
+- `cargo test`: a table is read (AutoEq's kind and a plain one) and set onto the frequencies kept; of a
+  made-up kind of device (three shapes of chance size), curves held out and shown only from 300 Hz to
+  2 kHz are guessed much nearer than the kind's average does; what was measured stays as it was and the
+  guess meets it without a step; with nothing to learn from, the measured part's level is carried on.
+- On real curves: the 736 headphones of one measurer (oratory1990) from AutoEq's results, brought in
+  with `import`. Every fifth by name was held out (147), the other 589 learned from; of each held-out
+  curve only a part was shown. The usual error (dB) over the frequencies not shown:
+
+  | shown | the guess | the kind's average alone | a level line |
+  |---|---|---|---|
+  | 300 Hz to 3 kHz | 4.37 | 4.47 | 4.93 |
+  | 100 Hz to 8 kHz | 4.18 | 4.75 | 5.43 |
+  | 500 Hz to 20 kHz | 4.07 | 4.17 | 4.69 |
+  | 20 Hz to 2 kHz | 4.19 | 4.34 | 4.71 |
+
+  **The guess is nearer than the average, by little** (2 to 12 percent): most of what makes one pair of
+  headphones differ from another outside the part shown is its own, and is not to be had from the part
+  shown. A wrong turn on the way: followed closely (hold 1), the guess was *worse* than the average
+  alone (5.2 to 8.1 dB); the hold now learned for this kind is 30.
+- `guess --type headphones --like "WH-1000XM4"`: the correction lies 0.32 dB from what is wanted (1.27 dB
+  at the most); off its target within reach 3.20 dB as its measurer found it, 0.84 dB with the
+  correction *if this pair is as that one was*. Kept as the calibration "WH-1000XM4". Not listened to.
+
+Not done: the guesser has not been tried in the room (a quick guess, then a whole measurement to see how
+near flat it came). For speakers there is one curve to learn from, the calibration "Speakers" itself:
+a guess for these speakers at this place is then little more than that calibration again, and says
+nothing of other speakers. The training curves are not in this repository (they are their measurers').
+
 ## On Linux
 
 The equalizer, the modes, the spectrum and the window are the same code on both systems; only the
@@ -339,6 +410,7 @@ through the `windows` crate.
 bottle-eq                                          the window (on Linux: bottle-eq window --to <speakers>)
 bottle-eq devices                                  the output devices, their formats and blocks, and the microphones
 bottle-eq measure --mic <mic> --to <device>        a sweep out of the speakers, recorded by the microphone
+bottle-eq guess --mic <mic> --to <device>          one short sweep, the rest guessed, the correction set
 bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other (Enter stops)
 bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
 ```
