@@ -23,8 +23,11 @@
 //! - **The delay is the graph's.** Bottle EQ holds no sound from one cycle to the next. What is said as
 //!   the delay is what PipeWire says of the playback stream: how long what was just handed over takes
 //!   to reach the device, as for any program that plays.
-//! - **The quantum is asked for, not taken.** Both nodes ask for 128 frames (2.7 ms); the graph runs at
-//!   the least any of its nodes asks for, within what the system allows.
+//! - **The quantum is asked for, not taken.** Both nodes ask for 1024 frames (21 ms), the graph's
+//!   usual; the graph runs at the least any of its nodes asks for, within what the system allows.
+//!   Less can be asked for (`BOTTLE_EQ_BLOCK=128 bottle-eq`, 2.7 ms), where the sound card keeps up:
+//!   on a real machine 128 broke the sound up (heard, and the measurement came out wrong), which the
+//!   test box with no sound card could not show.
 //!
 //! The sound is 32-bit float, two channels, 48,000 Hz; where the graph runs at another rate PipeWire's
 //! own converter stands between.
@@ -46,8 +49,19 @@ use std::time::Duration;
 const OWN: &str = "bottle_eq";
 const RATE: u32 = 48000;
 const CHANNELS: usize = 2;
-/// the quantum asked for, in frames
-const QUANTUM: u32 = 128;
+/// the quantum asked for, in frames, unless BOTTLE_EQ_BLOCK says another
+const QUANTUM: u32 = 1024;
+/// the least and the most that can be asked for
+const QUANTA: std::ops::RangeInclusive<u32> = 32..=8192;
+
+/// The quantum asked for, in frames: BOTTLE_EQ_BLOCK when it is a number within reach, else the usual.
+fn quantum() -> u32 {
+    asked(std::env::var("BOTTLE_EQ_BLOCK").ok().as_deref())
+}
+
+fn asked(said: Option<&str>) -> u32 {
+    said.and_then(|s| s.trim().parse::<u32>().ok()).filter(|n| QUANTA.contains(n)).unwrap_or(QUANTUM)
+}
 /// the most frames taken from one block (a quantum is 8192 at the very most)
 const MOST: usize = 8192;
 
@@ -252,7 +266,8 @@ fn path(
     // one group: the two nodes run in the same cycle from the same driver, and are never linked to
     // each other by the session manager
     let group = format!("bottle-eq-{}", std::process::id());
-    let latency = format!("{QUANTUM}/{RATE}");
+    let quantum = quantum();
+    let latency = format!("{quantum}/{RATE}");
     let playback = pw::stream::StreamRc::new(
         core.clone(),
         "bottle-eq-out",
@@ -337,7 +352,7 @@ fn path(
             // the stream is made and linked: the path is open
             pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming if !sent.get() => {
                 sent.set(true);
-                let _ = tell.send(Ok(Opened { in_block: QUANTUM, out_block: QUANTUM, exclusive: false, out_bits: 32, note: String::new(), direct: true }));
+                let _ = tell.send(Ok(Opened { in_block: quantum, out_block: quantum, exclusive: false, out_bits: 32, note: String::new(), direct: true }));
             }
             pw::stream::StreamState::Error(why) => {
                 let _ = tell.send(Err(format!("playing to the target: {why}")));
@@ -451,7 +466,7 @@ pub fn play(output: &Output, sound: Vec<f32>) -> JoinHandle<()> {
                     *pw::keys::MEDIA_ROLE => "Music",
                     *pw::keys::NODE_NAME => "bottle_eq_test",
                     *pw::keys::TARGET_OBJECT => output.id.clone(),
-                    *pw::keys::NODE_LATENCY => format!("{QUANTUM}/{RATE}"),
+                    *pw::keys::NODE_LATENCY => format!("{}/{RATE}", quantum()),
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -518,6 +533,16 @@ mod tests {
         assert_eq!(name_in(r#"{"name":"alsa_output.usb-speakers.analog-stereo"}"#).as_deref(), Some("alsa_output.usb-speakers.analog-stereo"));
         assert_eq!(name_in(r#"{ "name": "bottle_eq" }"#).as_deref(), Some("bottle_eq"));
         assert_eq!(name_in("{}"), None);
+    }
+
+    #[test]
+    fn the_block_asked_for_is_the_usual_unless_a_number_within_reach_is_said() {
+        assert_eq!(asked(None), 1024);
+        assert_eq!(asked(Some("128")), 128);
+        assert_eq!(asked(Some(" 256 ")), 256);
+        assert_eq!(asked(Some("0")), 1024);
+        assert_eq!(asked(Some("100000")), 1024);
+        assert_eq!(asked(Some("short")), 1024);
     }
 
     #[test]

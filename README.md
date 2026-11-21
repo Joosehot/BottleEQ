@@ -380,6 +380,11 @@ bottle-eq window --to <speakers>  # starts at once; then choose "Bottle EQ" as t
 bottle-eq run --to <speakers> --mode rock
 ```
 
+Bottle EQ asks the graph for blocks of 1024 frames (21 ms), PipeWire's usual. On the first real machine
+it was tried on (2026-11-21), the 128 frames (2.7 ms) asked for until then broke the sound up, and a
+measurement made through that came out wrong; whether 1024 mends it there has not yet been heard.
+Where the sound card keeps up, less can be asked for: `BOTTLE_EQ_BLOCK=128 bottle-eq window ...`.
+
 Checked (2026-11-21) in a box without a sound card (`linux/Dockerfile`, `linux/test.sh`: Ubuntu 24.04,
 PipeWire 1.0.5 and WirePlumber, one output device that plays to nowhere):
 
@@ -397,8 +402,8 @@ PipeWire 1.0.5 and WirePlumber, one output device that plays to nowhere):
 - The window (under Xvfb, software OpenGL): it opens, shows the live spectrum of music played to
   "Bottle EQ", and its own test drags a point (`docs/window-linux.png`).
 
-Not done on Linux: it has never run on a real machine with a sound card and a desktop, so nobody has
-heard it, the delay is not measured (the box's device says 0 ms; what is shown is what PipeWire says of
+Not done on Linux: on a real machine with a sound card it has been tried once (see above: the sound
+broke up), the delay is not measured (the box's device says 0 ms; what is shown is what PipeWire says of
 the way to the device, as for any program), and programs that speak PulseAudio (browsers; through
 pipewire-pulse) have not been tried, only PipeWire's own.
 
