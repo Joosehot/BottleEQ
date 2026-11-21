@@ -74,6 +74,8 @@ pub struct Start {
     pub measure: bool,
     /// and then correct and measure again, by itself
     pub correct: bool,
+    /// the careful way of correcting, not the exact mirror
+    pub gentle: bool,
     /// the first measurement is a quick guess; and the kind of device
     pub guess: bool,
     pub kind: String,
@@ -201,6 +203,8 @@ struct Window {
     measure_soon: Option<Instant>,
     correct_soon: bool,
     guess_soon: bool,
+    /// a measured curve is turned over exactly (else the careful way)
+    exact: bool,
     /// the kind of device: what the guesser learns from, and what a calibration is kept as
     kind: String,
     /// the frequencies of `before` that were measured and believed (not guessed)
@@ -380,11 +384,14 @@ impl Window {
                     self.measure(true);
                 }
                 let correct = ui.add_enabled(self.measured.is_some(), egui::Button::new("Correct")).on_hover_text(
-                    "Turns the last measurement over into the equalizer's curve, so that what reaches the microphone becomes flat. Nothing is raised more than 6 dB, and nothing is done where the measurement is not to be believed or the speakers have nothing to give.\nThen measure again to see how near flat it came.",
+                    "Turns the last measurement over into the equalizer's curve, so that what reaches the microphone becomes flat. Nothing is done where the measurement is not to be believed or the speakers have nothing to give.\nThen measure again to see how near flat it came.",
                 );
                 if correct.clicked() {
                     self.correct();
                 }
+                ui.checkbox(&mut self.exact, "exact mirror").on_hover_text(
+                    "Ticked: the correction is the mirror image of the measured curve as it was measured, raised as much as 12 dB, with as many as 24 points. Flattest at the place that was measured; it asks more of the speakers and takes more headroom.\nUnticked: the careful way: read a third of an octave wide, raised 6 dB at the most, faded toward the ends of what the speakers can do, 8 points. It holds better a step to the side.",
+                );
             });
             let text = match &self.measuring {
                 Some((_, began, short)) => format!("measuring: keep quiet ... {:.0} s", (if *short { measure::SHORT_TAKES } else { measure::TAKES } - began.elapsed().as_secs_f64()).max(0.0)),
@@ -433,12 +440,13 @@ impl Window {
     /// Turn the last measurement over into the equalizer's curve.
     fn correct(&mut self) {
         let Some(m) = &self.measured else { return };
-        let want = calibrate::wanted(m);
+        let how = if self.exact { &calibrate::EXACT } else { &calibrate::GENTLE };
+        let want = calibrate::wanted(m, how);
         if !want.reach.iter().any(|r| *r) {
             self.measure_said = "nothing of the measurement is within reach: there is nothing to correct by".to_string();
             return;
         }
-        let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, self.rate());
+        let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, self.rate(), how);
         self.settings.set_all(&fitted.gains);
         self.settings.set_points(&fitted.points);
         self.mode.clear();
@@ -949,6 +957,7 @@ pub fn open(start: Start) -> Result<(), String> {
         measure_soon: start.measure.then(|| Instant::now() + std::time::Duration::from_secs(1)),
         correct_soon: start.correct,
         guess_soon: start.guess,
+        exact: !start.gentle,
         kind: start.kind,
         before_measured: Vec::new(),
         before: None,

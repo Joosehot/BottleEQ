@@ -8,8 +8,9 @@
 //!                                                      a sweep out of the speakers, recorded by the
 //!                                                      microphone: what reaches the listening place. With
 //!                                                      --from it goes through the path and the equalizer
-//!       ... --correct [--save <name>]                  and then: the measured curve turned over into the
-//!                                                      equalizer's, measured again through it, and kept
+//!       ... --correct [--save <name>] [--gentle]       and then: the measured curve turned over into the
+//!                                                      equalizer's (its exact mirror image; --gentle: the
+//!                                                      careful way), measured again through it, and kept
 //!                                                      as a calibration of that name
 //!   bottle-eq calibrations                             the calibrations kept
 //!   bottle-eq guess --mic <microphone> --to <device> [--from <device>] [--type speakers|headphones] [--save <name>]
@@ -328,6 +329,9 @@ fn main() {
     };
     let (exclusive, shared, measure_flag, correct) = (flag("--exclusive"), flag("--shared"), flag("--measure"), flag("--correct"));
     let (test_flag, guess_flag) = (flag("--test"), flag("--guess"));
+    // a measured curve is turned over exactly, unless the careful way is asked for
+    let gentle = flag("--gentle");
+    let how = if gentle { &calibrate::GENTLE } else { &calibrate::EXACT };
     let gains = Arc::new(Settings::default());
     gains.set_volume(volume);
     let given = gains_text.map(|g| parse_gains(&g));
@@ -375,6 +379,7 @@ fn main() {
                 measure: measure_flag,
                 correct,
                 guess: guess_flag,
+                gentle,
                 kind: kind.clone(),
             };
             window::open(start).unwrap_or_else(|e| fail(&e));
@@ -420,8 +425,8 @@ fn main() {
             let curves = guess::training(&kind);
             let curve = guess::named(&curves, like_text.as_deref().unwrap_or_default()).unwrap_or_else(|e| fail(&e));
             let m = guess::like(&curve, &guess::learn(&curves));
-            let want = calibrate::wanted(&m);
-            let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0);
+            let want = calibrate::wanted(&m, how);
+            let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0, how);
             gains.set_all(&fitted.gains);
             gains.set_points(&fitted.points);
             println!("\"{}\", one of the {} curves of {kind}: not measured here; what its measurer found it to be off by (from its target, where the file says one)", curve.name, curves.len());
@@ -495,15 +500,15 @@ fn main() {
             }
             if correct || guessing {
                 // the measured curve turned over into the equalizer's
-                let want = calibrate::wanted(&m);
-                let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, target.rate as f64);
+                let want = calibrate::wanted(&m, how);
+                let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, target.rate as f64, how);
                 gains.set_all(&fitted.gains);
                 gains.set_points(&fitted.points);
                 println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);
                 show_gains(&gains, target.rate);
                 let before = calibrate::spread(&calibrate::raw(&m), &want.reach);
                 let (from, to) = ((0..m.hz.len()).find(|i| want.reach[*i]).map_or(0.0, |i| m.hz[i]), (0..m.hz.len()).rev().find(|i| want.reach[*i]).map_or(0.0, |i| m.hz[i]));
-                println!("within reach (believed, and not more than {} dB under the rest): {} frequencies from {from:.0} Hz to {to:.0} Hz", calibrate::REACH, want.reach.iter().filter(|r| **r).count());
+                println!("within reach (believed, and not more than {} dB under the rest): {} frequencies from {from:.0} Hz to {to:.0} Hz", how.reach, want.reach.iter().filter(|r| **r).count());
                 if running.is_some() {
                     // and measured again through it, at the same frequencies
                     std::thread::sleep(Duration::from_secs(1));
@@ -548,8 +553,8 @@ fn main() {
             if n == 0 {
                 fail(&format!("{path}: no measurement in it"));
             }
-            let want = calibrate::wanted(&m);
-            let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0);
+            let want = calibrate::wanted(&m, how);
+            let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0, how);
             gains.set_all(&fitted.gains);
             gains.set_points(&fitted.points);
             println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);

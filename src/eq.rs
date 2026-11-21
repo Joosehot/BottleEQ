@@ -5,7 +5,7 @@
 //! - **Ten bands** at the octave centres from 31.5 Hz to 16 kHz: the lowest a low shelf, the highest a
 //!   high shelf, the eight between peaks one octave wide, each with a gain. A *mode* (modes.txt) is a
 //!   named set of these ten gains.
-//! - **Points**, as in FL Studio's parametric EQ: up to eight filters that can be put anywhere. A point
+//! - **Points**, as in FL Studio's parametric EQ: up to 24 filters that can be put anywhere. A point
 //!   has a frequency, a gain, a width and a kind:
 //!   - a *cut* is a slope: below a low cut (above a high cut) the sound falls away 12 dB an octave, so
 //!     the curve starts (or ends) with a slope; its width is how sharp the corner is, and a sharp one
@@ -39,8 +39,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub const BANDS: usize = 10;
 pub const CENTRES: [f32; BANDS] = [31.5, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
-/// the most points a curve can have
-pub const POINTS: usize = 8;
+/// the most points a curve can have (an exact mirror of a measured curve takes many)
+pub const POINTS: usize = 24;
 /// a band's peak is one octave wide
 const BAND_Q: f32 = std::f32::consts::SQRT_2;
 /// a point's width when none is given: a broad bump; and a cut's: the flattest corner there is
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn everything_at_its_most_stays_sound() {
         for most in [MOST, -MOST] {
-            let points: Vec<Point> = (0..POINTS).map(|i| Point { hz: 40.0 * 2.3f32.powi(i as i32), db: most, q: 8.0, kind: None }).collect();
+            let points: Vec<Point> = (0..8).map(|i| Point { hz: 40.0 * 2.3f32.powi(i), db: most, q: 8.0, kind: None }).collect();
             let set = settings(&[most; BANDS], &points);
             let mut eq = Eq::new(RATE);
             let mut sound: Vec<f32> = (0..RATE * 2).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();

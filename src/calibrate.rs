@@ -13,18 +13,41 @@
 //! - **The curve** (`fit`) is made of what the equalizer has: the ten bands' gains, then points (peaks
 //!   put where the most is still missing, each with its frequency, gain and width), each number tried
 //!   in turn until the curve lies on what is wanted.
+//! - **Two ways of doing it** (`How`): `EXACT`, the mirror image of the measured curve as it is (a sixth
+//!   of an octave wide, as it was measured; raised up to 12 dB; nothing faded; as many as 24 points),
+//!   and `GENTLE`, the careful one described above (8 points). The exact one is flatter at the place
+//!   that was measured and asks more of the speakers; the gentle one holds better a step to the side.
 //! - **A calibration** is that curve with a name, the devices and the day, and the measurement it was
 //!   made from: a file in the folder `calibrations` where Bottle EQ is run from.
 
 use crate::eq::{Curve, Kind, Point, Settings, BANDS, MOST, POINTS};
 use crate::measure::Measured;
 
-/// the most a frequency is raised, in dB
-pub const MOST_UP: f32 = 6.0;
-/// a point is added while this much is still missing somewhere, in dB
-const WORTH: f32 = 0.75;
-/// a level this far under the rest is past the end of what the speakers can do, in dB
-pub const REACH: f32 = 10.0;
+/// How a measured curve is turned over.
+pub struct How {
+    /// how wide what is wanted is read: this many frequencies (24ths of an octave) to each side
+    pub wide: usize,
+    /// the most a frequency is raised, in dB
+    pub up: f32,
+    /// a level this far under the rest is past the end of what the speakers can do, in dB
+    pub reach: f32,
+    /// whether what is wanted fades out toward the ends of the reach
+    pub fade: bool,
+    /// the most points the curve is made of
+    pub points: usize,
+    /// a point is added while this much is still missing somewhere, in dB
+    pub worth: f32,
+    /// how near another a point may be put, in octaves, and the narrowest it may be (as 2 to this)
+    pub apart: f32,
+    pub narrowest: f32,
+    /// every which of the frequencies the curve is fitted at
+    pub every: usize,
+}
+
+/// The mirror image of what was measured, as it was measured.
+pub const EXACT: How = How { wide: 0, up: MOST, reach: MOST, fade: false, points: POINTS, worth: 0.4, apart: 0.17, narrowest: 3.3, every: 1 };
+/// The careful one: a third of an octave wide, raised 6 dB at the most, faded toward the ends, eight points.
+pub const GENTLE: How = How { wide: 4, up: 6.0, reach: 10.0, fade: true, points: 8, worth: 0.75, apart: 0.33, narrowest: 2.3, every: 2 };
 /// how much the curve is held at 0 dB where the measurement is not to be believed, against 1 where it is
 const HOLD: f32 = 0.3;
 
@@ -63,22 +86,22 @@ pub struct Wanted {
 }
 
 /// What the equalizer should do to make what was measured flat.
-pub fn wanted(m: &Measured) -> Wanted {
+pub fn wanted(m: &Measured, how: &How) -> Wanted {
     let alone = raw(m);
-    // a third of an octave wide: four places to each side (the frequencies are a 24th of an octave apart)
-    let wide: Vec<f32> = (0..alone.len()).map(|i| mean((i.saturating_sub(4)..(i + 5).min(alone.len())).filter(|j| m.certain[*j]).map(|j| alone[j]))).collect();
+    // as wide as asked: so many places to each side (the frequencies are a 24th of an octave apart)
+    let wide: Vec<f32> = (0..alone.len()).map(|i| mean((i.saturating_sub(how.wide)..(i + how.wide + 1).min(alone.len())).filter(|j| m.certain[*j]).map(|j| alone[j]))).collect();
     // (`raw` is against the average of the middle, so "the rest" is 0 dB)
     // the reach is from the first to the last third of an octave (eight places running) that is certain
     // and not too far under the rest; a hole between them is within it
-    let up: Vec<bool> = (0..wide.len()).map(|i| m.certain[i] && wide[i] > -REACH).collect();
+    let up: Vec<bool> = (0..wide.len()).map(|i| m.certain[i] && wide[i] > -how.reach).collect();
     let runs: Vec<usize> = (0..wide.len().saturating_sub(7)).filter(|i| up[*i..*i + 8].iter().all(|u| *u)).collect();
     let (first, last) = (runs.first().copied().unwrap_or(usize::MAX), runs.last().map_or(0, |i| i + 7));
     let reach: Vec<bool> = (0..wide.len()).map(|i| m.certain[i] && i >= first && i <= last).collect();
     // what is within reach is turned over about its own mean, so that as much is raised as lowered
     let level = mean((0..wide.len()).filter(|i| reach[*i]).map(|i| wide[i]));
     // fading out over a third of an octave (eight places) toward where the reach ends
-    let near_end = |i: usize| (1..=8).find(|d| !reach.get(i + d).copied().unwrap_or(true) || (i >= *d && !reach[i - d])).map_or(1.0, |d| d as f32 / 9.0);
-    let db = (0..wide.len()).map(|i| if reach[i] { (level - wide[i]).clamp(-MOST, MOST_UP) * near_end(i) } else { 0.0 }).collect();
+    let near_end = |i: usize| if how.fade { (1..=8).find(|d| !reach.get(i + d).copied().unwrap_or(true) || (i >= *d && !reach[i - d])).map_or(1.0, |d| d as f32 / 9.0) } else { 1.0 };
+    let db = (0..wide.len()).map(|i| if reach[i] { (level - wide[i]).clamp(-MOST, how.up) * near_end(i) } else { 0.0 }).collect();
     Wanted { db, counts: reach.iter().map(|r| if *r { 1.0 } else { HOLD }).collect(), reach }
 }
 
@@ -119,9 +142,8 @@ pub struct Fitted {
 }
 
 /// The equalizer's curve that lies nearest to what is wanted: the ten bands, then up to eight points.
-pub fn fit(hz: &[f32], want: &[f32], counts: &[f32], rate: f64) -> Fitted {
-    // every second frequency is looked at: a twelfth of an octave apart is close enough to fit by
-    let looked: Vec<usize> = (0..hz.len()).step_by(2).collect();
+pub fn fit(hz: &[f32], want: &[f32], counts: &[f32], rate: f64, how: &How) -> Fitted {
+    let looked: Vec<usize> = (0..hz.len()).step_by(how.every).collect();
     let missing = |gains: &[f32; BANDS], points: &[Point]| -> f32 {
         let c = curve(gains, points);
         looked.iter().map(|i| counts[*i] * (c.response_db(rate, hz[*i] as f64) - want[*i]).powi(2)).sum()
@@ -147,20 +169,20 @@ pub fn fit(hz: &[f32], want: &[f32], counts: &[f32], rate: f64) -> Fitted {
         for _ in 0..2 {
             point.db = lowest(-MOST, MOST, |db| missing(gains, &with(Point { db, ..*point }, others)));
             let q = point.q.log2();
-            point.q = 2f32.powf(lowest((q - 1.6).max(-1.5), (q + 1.6).min(2.3), |q| missing(gains, &with(Point { q: 2f32.powf(q), ..*point }, others))));
+            point.q = 2f32.powf(lowest((q - 1.6).max(-1.5), (q + 1.6).min(how.narrowest), |q| missing(gains, &with(Point { q: 2f32.powf(q), ..*point }, others))));
             point.hz *= 2f32.powf(lowest(-0.33, 0.33, |up| missing(gains, &with(Point { hz: point.hz * 2f32.powf(up), ..*point }, others))));
         }
     };
     // places where a point was tried and did not help: not tried again
     let mut no_use: Vec<f32> = Vec::new();
-    while points.len() < POINTS && no_use.len() < 6 {
+    while points.len() < how.points && no_use.len() < 6 + how.points / 2 {
         // where the most is still missing
         let c = curve(&gains, &points);
         let still: Vec<f32> = (0..hz.len()).map(|i| counts[i] * (want[i] - c.response_db(rate, hz[i] as f64))).collect();
         // (nor where a point already is: two at one place only fight over it)
-        let open = |i: &usize| no_use.iter().chain(points.iter().map(|p| &p.hz)).all(|tried| (hz[*i] / tried).log2().abs() > 0.33);
+        let open = |i: &usize| no_use.iter().chain(points.iter().map(|p| &p.hz)).all(|tried| (hz[*i] / tried).log2().abs() > how.apart);
         let Some(worst) = (0..hz.len()).filter(open).max_by(|a, b| still[*a].abs().total_cmp(&still[*b].abs())) else { break };
-        if still[worst].abs() < WORTH {
+        if still[worst].abs() < how.worth {
             break;
         }
         // as wide as the stretch around it where at least half as much is missing, on the same side
@@ -168,7 +190,7 @@ pub fn fit(hz: &[f32], want: &[f32], counts: &[f32], rate: f64) -> Fitted {
         let from = (0..worst).rev().find(|i| !part(*i)).map_or(0, |i| i + 1);
         let to = (worst..hz.len()).find(|i| !part(*i)).unwrap_or(hz.len());
         let octaves = (hz[to - 1] / hz[from]).log2().max(1.0 / 12.0);
-        let q = (2f32.powf(octaves).sqrt() / (2f32.powf(octaves) - 1.0)).clamp(0.4, 4.9);
+        let q = (2f32.powf(octaves).sqrt() / (2f32.powf(octaves) - 1.0)).clamp(0.4, 2f32.powf(how.narrowest));
         let before = missing(&gains, &points);
         let mut point = Point { hz: (hz[from] * hz[to - 1]).sqrt(), db: still[worst].clamp(-MOST, MOST), q, kind: Some(Kind::Peak) };
         tune(&mut point, &gains, &points);
@@ -345,8 +367,8 @@ mod tests {
     #[test]
     fn the_correction_makes_the_speakers_flat() {
         let m = measured(&speakers(), 20.0);
-        let want = wanted(&m);
-        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0);
+        let want = wanted(&m, &GENTLE);
+        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0, &GENTLE);
         assert!(fitted.off < 0.5 && fitted.most_off < 2.0, "the curve is {} dB off what is wanted, {} at the most", fitted.off, fitted.most_off);
         // the speakers through the correction: flat where they were not
         let correction = curve(&fitted.gains, &fitted.points);
@@ -361,14 +383,14 @@ mod tests {
         // speakers with nothing below 100 Hz (not certain there) and a hole 20 dB deep at 3 kHz
         let small = curve(&[0.0; BANDS], &[Point { hz: 3000.0, db: -12.0, q: 4.0, kind: Some(Kind::Peak) }, Point { hz: 3000.0, db: -8.0, q: 4.0, kind: Some(Kind::Peak) }]);
         let m = measured(&small, 100.0);
-        let want = wanted(&m);
-        assert!(want.db.iter().all(|w| *w <= MOST_UP + 0.01), "nothing is raised more than {MOST_UP} dB");
+        let want = wanted(&m, &GENTLE);
+        assert!(want.db.iter().all(|w| *w <= GENTLE.up + 0.01), "nothing is raised more than {} dB", GENTLE.up);
         assert!((0..m.hz.len()).all(|i| m.certain[i] || want.db[i] == 0.0));
-        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0);
+        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0, &GENTLE);
         let correction = curve(&fitted.gains, &fitted.points);
         assert!(correction.response_db(48000.0, 40.0).abs() < 1.0, "at 40 Hz the correction is {} dB", correction.response_db(48000.0, 40.0));
         let at_hole = correction.response_db(48000.0, 3000.0);
-        assert!(at_hole > 2.0 && at_hole < MOST_UP + 1.0, "at the hole the correction is {at_hole} dB");
+        assert!(at_hole > 2.0 && at_hole < GENTLE.up + 1.0, "at the hole the correction is {at_hole} dB");
     }
 
     #[test]
@@ -376,16 +398,42 @@ mod tests {
         // speakers (or a microphone) with nothing above 9 kHz: measured, certain, and 30 dB down
         let cut = Point { kind: Some(Kind::HighCut), q: 0.7, ..Point::new(9000.0, 0.0) };
         let m = measured(&curve(&[0.0, 0.0, 4.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.0], &[cut, cut, cut]), 20.0);
-        let want = wanted(&m);
+        let want = wanted(&m, &GENTLE);
         let at = |hz: f32| (0..m.hz.len()).find(|i| m.hz[*i] >= hz).unwrap();
         assert!(!want.reach[at(16000.0)] && want.db[at(16000.0)] == 0.0 && want.reach[at(1000.0)]);
-        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0);
+        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0, &GENTLE);
         let correction = curve(&fitted.gains, &fitted.points);
         assert!(correction.response_db(48000.0, 16000.0).abs() < 1.5, "at 16 kHz the correction is {} dB", correction.response_db(48000.0, 16000.0));
         // and where the speakers are whole (up to 5 kHz) it is flat
         let after: Vec<f32> = (0..m.hz.len()).map(|i| m.db[i] + correction.response_db(48000.0, m.hz[i] as f64)).collect();
         let whole: Vec<bool> = m.hz.iter().map(|hz| (30.0..5000.0).contains(hz)).collect();
         assert!(spread(&m.db, &whole) > 1.5 && spread(&after, &whole) < 0.6, "from {} to {} dB from flat up to 5 kHz", spread(&m.db, &whole), spread(&after, &whole));
+    }
+
+    #[test]
+    fn the_exact_mirror_follows_what_the_gentle_one_leaves() {
+        // speakers and a room: the speakers' broad shape, and on it narrow ups and downs every third
+        // of an octave or so, and a hole 9 dB deep
+        let broad = speakers();
+        let mut m = measured(&broad, 20.0);
+        for i in 0..m.hz.len() {
+            let octaves = (m.hz[i] / 20.0).log2();
+            m.db[i] += 2.5 * (octaves * 9.0).sin() + 1.5 * (octaves * 5.3 + 1.0).sin() - 9.0 * (-((m.hz[i] / 700.0).log2().powi(2)) / 0.004).exp();
+        }
+        let heard: Vec<bool> = m.hz.iter().map(|hz| (40.0..16000.0).contains(hz)).collect();
+        let after = |how: &How| {
+            let want = wanted(&m, how);
+            let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0, how);
+            let correction = curve(&fitted.gains, &fitted.points);
+            let with: Vec<f32> = (0..m.hz.len()).map(|i| m.db[i] + correction.response_db(48000.0, m.hz[i] as f64)).collect();
+            (spread(&with, &heard), fitted.points.len(), correction.response_db(48000.0, 700.0))
+        };
+        let (gentle, exact) = (after(&GENTLE), after(&EXACT));
+        assert!(spread(&m.db, &heard) > 3.0);
+        assert!(exact.0 < 0.8 && exact.0 < 0.6 * gentle.0, "from flat: {} dB with the exact mirror, {} dB with the gentle one", exact.0, gentle.0);
+        assert!(exact.1 > 8 && gentle.1 <= 8, "{} points in the exact mirror, {} in the gentle", exact.1, gentle.1);
+        // the narrow hole: the gentle one reads over it, the exact one goes into it
+        assert!(exact.2 > gentle.2 + 2.0, "at the hole: {} dB exact, {} dB gentle", exact.2, gentle.2);
     }
 
     #[test]
@@ -402,8 +450,8 @@ mod tests {
     #[test]
     fn a_calibration_is_read_back_as_it_was_written() {
         let m = measured(&speakers(), 60.0);
-        let want = wanted(&m);
-        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0);
+        let want = wanted(&m, &GENTLE);
+        let fitted = fit(&m.hz, &want.db, &want.counts, 48000.0, &GENTLE);
         let c = Calibration { name: "Speakers at the desk".to_string(), kind: "headphones".to_string(), device: "Speakers (USB2.0 Device)".to_string(), microphone: "Microphone".to_string(), day: today(), gains: fitted.gains, points: fitted.points, hz: m.hz.clone(), raw: raw(&m), certain: m.certain.clone() };
         let back = Calibration::read(&c.written()).unwrap();
         assert_eq!((back.name.as_str(), back.kind.as_str(), back.device.as_str(), back.day.as_str()), (c.name.as_str(), "headphones", c.device.as_str(), c.day.as_str()));

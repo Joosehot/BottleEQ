@@ -225,9 +225,20 @@ line what was measured again through the correction.
 - **Nothing is done** where the measurement is not to be believed, nor past the ends of what the
   speakers can do (where the level lies more than 10 dB under the rest); toward those ends what is
   wanted fades out over a third of an octave, so a falling edge is not propped up.
-- **The curve** is made of what the equalizer has: the ten bands' gains, then up to eight points put
+- **The curve** is made of what the equalizer has: the ten bands' gains, then points (up to eight) put
   where the most is still missing, each number tried in turn until the curve lies on what is wanted. It
   takes half a second.
+
+**Two ways of turning the curve over.** What is described above is the careful way (`--gentle`, or
+"exact mirror" unticked in the window). The other, which is what Correct does unless told otherwise, is
+the **exact mirror**: the mirror image of the measured curve as it was measured (a sixth of an octave
+wide), raised as much as 12 dB, not faded toward the ends, made of as many as 24 points (the equalizer
+holds 24 since this; it held 8). It is flattest at the place that was measured; it asks more of the
+speakers, takes more headroom (turn the volume up), and a step to the side the narrow things it set
+right are elsewhere. On the measurement kept from the room (nothing played): the exact mirror's curve
+lies 0.45 dB from what is wanted and would bring 4.11 dB from flat to 0.62 dB, the careful way 3.97 dB
+to 1.90 dB, *if the speakers do as the curve says*; that the careful way does was measured (1.76 dB),
+the exact mirror has not been measured in the room yet. Making it takes about three seconds.
 
 **Save** keeps the curve under a name ("Speakers", "Headphones") with the devices, the day and the
 measurement it was made from: a file in the folder `calibrations` where Bottle EQ is run from. The list
