@@ -1,7 +1,8 @@
 # Bottle EQ
 
 A system-wide audio equalizer for Windows and Linux with a live visualizer, in Rust. Built in five steps; all five
-are made, and nobody has yet sat with it and listened.
+are made, and so is measuring and correcting with a microphone. Its owner has listened to it on
+Windows (2026-11-21); on Linux nobody has.
 
 1. **Audio capture** (done): what Windows plays is captured by WASAPI loopback and played back out,
    5.8 ms later.
@@ -51,7 +52,7 @@ Checked:
   egui as pointer events) dragged to 12 kHz and +9 dB while the music played; the spectrum shows the
   slope and the spike in the sound. Delay 5.0 ms on average, 6.9 ms at the longest, no gap.
 
-Not done: no hand has dragged it yet and nobody has listened. The devices chosen are not remembered
+Its owner has used it and listened through it (2026-11-21). Not done: the devices chosen are not remembered
 from one opening to the next. Run by double click, a console window opens beside it.
 
 ## The equalizer
@@ -130,7 +131,7 @@ Measured:
   (The 0.37 dB is on the flank of the narrow spike, where the measuring band, a twelfth of an octave, is
   wide against the curve's bend.) No gap, delay 5.9 ms on average and 8.1 ms at the longest.
 
-Not done: nobody has heard it.
+Heard by its owner through the window (2026-11-21).
 
 ## Measure and calibrate
 
@@ -246,7 +247,8 @@ Measured (2026-11-21):
   What is left is mostly what was not asked for: the narrow dips and peaks inside a third of an
   octave, and the dip at 1.6 to 2 kHz, which is deeper than the 6 dB it may be raised by.
 
-Not done: nobody has listened to it. Only these speakers and this microphone were tried, at one place
+Listened to by its owner (2026-11-21, the calibration "Speakers" against the equalizer off, music
+through the window): "the sound is clean and the change is massive". Not done: only these speakers and this microphone were tried, at one place
 in the room; headphones cannot be measured this way (a microphone in the room does not hear what an ear
 inside them does). The microphone's own response is turned over along with the speakers'.
 
