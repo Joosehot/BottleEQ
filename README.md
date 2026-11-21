@@ -132,6 +132,64 @@ Measured:
 
 Not done: nobody has heard it.
 
+## Measure and calibrate
+
+Three stages; the first is made.
+
+1. **Measurement** (done): what reaches the listening place is measured with a microphone.
+2. Correction: the measured curve turned over into the equalizer's curve, kept as named calibrations.
+3. Guesser: a whole correction guessed from a short, noisy sample and the kind of device.
+
+### Stage 1: measuring
+
+![A measurement in the window](docs/window-measured.png)
+
+In the window: choose the microphone, put it where you listen, press **Measure**. A sine rises from
+20 Hz to 20 kHz in ten seconds out of the speakers (loud; about 15 seconds in all with the silence
+recorded before and after) while the microphone records. The blue line is what reached it, on the
+curve's own scale, against its own average between 200 Hz and 5 kHz. Where a frequency is not at least
+10 dB above the room's noise the line is dotted. Measure again at any time; the line is the last one.
+From the keyboard: `bottle-eq measure --mic <microphone> --to <speakers> [--from <source>] [--keep file.csv]`.
+
+While the path runs the sweep is played to its source, so it passes the equalizer as music does: the
+line is then what the seat gets with the curve that is set. Stopped, it goes straight to the speakers.
+
+How (`src/measure.rs`): the recording's spectrum over the sweep's is what the way from the program to
+the microphone did to each frequency; turned back into time it is a spike where the sound arrives and
+the room's echoes after it. Nothing is lined up by hand: where the spike stands is the delay. The ten
+seconds of sweep are gathered into that spike while the noise stays spread over the whole time, and
+only the half second around the spike is kept; what noise remains is read with the same window after
+the spike, where only noise is.
+
+**The microphone is in the curve.** What is measured is speakers, room and microphone together; a
+cheap microphone's weak bass or treble cannot be told from the speakers'.
+
+Measured (2026-11-21):
+
+- `cargo test`: a way that changes nothing measures flat within 0.2 dB from 25 Hz to 18 kHz (at 48,000
+  and 44,100 Hz); the equalizer's ten bands are measured through noise within 0.5 dB; a small speaker in
+  a noisy room has its bass marked uncertain and the rest right; a recording without the sweep says so.
+- On Linux, with a microphone that hears exactly what the speakers are given (`linux/test.sh`): flat
+  measures flat within 0.11 dB, and ten bands set are measured as set: mean difference 0.01 dB, biggest
+  0.06 dB.
+- In the room, the USB speakers and a USB microphone (`Microphone (USB PnP Audio Device)`):
+  - 86% of the frequencies are clearly above the noise. Nothing arrives below about 60 Hz, and above
+    9 kHz it falls away by 25 dB and more (speakers or microphone: it cannot be told which);
+  - the same measurement twice (frequencies from 62 Hz to 8.9 kHz that are 25 dB above the noise):
+    mean difference 0.28 dB, biggest 3.5 dB at 8.6 kHz, where the curve falls steeply;
+  - straight to the speakers against through the path, flat: mean difference 0.31 dB;
+  - ten bands set (`6,0,-4,0,3,-6,0,4,0,-3`) against flat, less the curve set: from 500 Hz to 4 kHz the
+    measured change is the curve within 0.05 dB (at 494 Hz +1.76 for +1.76, at 987 Hz -5.22 for -5.28,
+    at 3948 Hz +3.74 for +3.77); at 247 Hz +0.34 for -0.44, at 123 Hz -4.61 for -3.89, at 64 Hz -5.66
+    for -0.40;
+  - **below about 100 Hz these two devices do not answer the same at another level**: with the sweep
+    10 dB quieter the level at 80 Hz is 7 dB lower again and at 64 Hz 24 dB lower again (from 100 Hz up:
+    within about 1 dB). So down there the line is not one curve that an equalizer could turn over, and
+    being above the noise does not show it.
+
+Not done: no check yet that marks such frequencies (measuring at two levels would); nobody but the
+program's own test has pressed Measure in the window.
+
 ## On Linux
 
 The equalizer, the modes, the spectrum and the window are the same code on both systems; only the
@@ -207,7 +265,8 @@ through the `windows` crate.
 
 ```
 bottle-eq                                          the window (on Linux: bottle-eq window --to <speakers>)
-bottle-eq devices                                  the output devices, their formats and blocks
+bottle-eq devices                                  the output devices, their formats and blocks, and the microphones
+bottle-eq measure --mic <mic> --to <device>        a sweep out of the speakers, recorded by the microphone
 bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other (Enter stops)
 bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
 ```

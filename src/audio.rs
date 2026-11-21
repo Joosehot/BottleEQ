@@ -6,13 +6,16 @@
 //! - Linux: `pipewire.rs`, a device of Bottle EQ's own in the PipeWire graph.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 #[cfg(windows)]
 mod wasapi;
 #[cfg(windows)]
-pub use wasapi::{outputs, play, run, tone};
+pub use wasapi::{inputs, outputs, play, run, tone};
+#[cfg(windows)]
+use wasapi::listen_to;
 /// what the system is called when the one who uses it is told what to do there
 #[cfg(windows)]
 pub const SYSTEM: &str = "Windows";
@@ -20,7 +23,9 @@ pub const SYSTEM: &str = "Windows";
 #[cfg(target_os = "linux")]
 mod pipewire;
 #[cfg(target_os = "linux")]
-pub use pipewire::{outputs, play, run, tone};
+pub use pipewire::{inputs, outputs, play, run, tone};
+#[cfg(target_os = "linux")]
+use pipewire::listen_to;
 #[cfg(target_os = "linux")]
 pub const SYSTEM: &str = "Linux";
 
@@ -146,5 +151,65 @@ impl Drop for Running {
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+    }
+}
+
+/// A microphone (any input device).
+#[derive(Clone)]
+pub struct Input {
+    pub id: String,
+    pub name: String,
+    pub default: bool,
+}
+
+/// An input by its number in the list or by a part of its name.
+pub fn find_input(wanted: &str) -> Result<Input, String> {
+    let all = inputs()?;
+    let by_number = wanted.parse::<usize>().ok().filter(|n| (1..=all.len()).contains(n)).map(|n| n - 1);
+    let by_name = || all.iter().position(|i| i.name.to_lowercase().contains(&wanted.to_lowercase()));
+    match by_number.or_else(by_name) {
+        Some(i) => Ok(all[i].clone()),
+        None => Err(format!("no microphone matches \"{wanted}\" (there are: {})", all.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("; "))),
+    }
+}
+
+/// A recording under way: it runs until it is finished.
+pub struct Recording {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<Result<Vec<f32>, String>>,
+    rate: u32,
+}
+
+/// Begin recording a microphone (one channel: its channels' mean). At most two minutes are kept.
+pub fn record(input: &Input) -> Result<Recording, String> {
+    let (stop, input) = (Arc::new(AtomicBool::new(false)), input.clone());
+    let (said, heard) = channel::<Result<u32, String>>();
+    let s = stop.clone();
+    let thread = std::thread::spawn(move || {
+        let mut sound = Vec::new();
+        match listen_to(&input, &s, &said, &mut sound) {
+            Ok(()) => Ok(sound),
+            Err(e) => {
+                let _ = said.send(Err(e.clone()));
+                Err(e)
+            }
+        }
+    });
+    match heard.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(rate)) => Ok(Recording { stop, thread, rate }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            stop.store(true, Ordering::Relaxed);
+            Err("the microphone did not start".to_string())
+        }
+    }
+}
+
+impl Recording {
+    /// Stop, and give what was recorded: (rate, samples).
+    pub fn finish(self) -> Result<(u32, Vec<f32>), String> {
+        self.stop.store(true, Ordering::Relaxed);
+        let sound = self.thread.join().map_err(|_| "the recording broke off".to_string())??;
+        Ok((self.rate, sound))
     }
 }

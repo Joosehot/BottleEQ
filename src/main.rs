@@ -2,7 +2,12 @@
 //!
 //!   bottle-eq [window] [--from <device>] [--to <device>]   the window: the live spectrum, the curve and
 //!                                                      its points to drag, the modes, Flat, Start and Stop
-//!   bottle-eq devices                                  the output devices, their formats and blocks
+//!   bottle-eq devices                                  the output devices, their formats and blocks, and
+//!                                                      the microphones
+//!   bottle-eq measure --mic <microphone> --to <device> [--from <device>] [--level <0..1>] [--keep <csv file>]
+//!                                                      a sweep out of the speakers, recorded by the
+//!                                                      microphone: what reaches the listening place. With
+//!                                                      --from it goes through the path and the equalizer
 //!   bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other
 //!   bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
 //!   bottle-eq playtest --from <device> --to <device> --file <wav> [--record <folder>] [--level <0..1>]
@@ -30,12 +35,14 @@
 //!
 //! The window begins at once when --exclusive or --shared is given with both devices; else it waits for
 //! Start. For trying it out: --file <wav> [--level x] is played to the source, --drag <point>:<hz>:<dB>
-//! drags a point there by itself, and --shot <bmp> [--seconds n] keeps a picture of the window and closes.
+//! drags a point there by itself, --mic <microphone> --measure measures by itself a second after opening,
+//! and --shot <bmp> [--seconds n] keeps a picture of the window and closes.
 //!
 //! Steps 1 to 5 of 5.
 
 mod audio;
 mod eq;
+mod measure;
 mod ring;
 mod spectrum;
 mod window;
@@ -282,7 +289,9 @@ fn main() {
     let from = from.or(cfg!(target_os = "linux").then(|| "1".to_string()));
     let cushion_ms: f32 = take("--cushion-ms").map(|s| s.parse().unwrap_or_else(|_| fail("--cushion-ms takes a number"))).unwrap_or(2.0);
     let (file, record) = (take("--file"), take("--record"));
-    let level: f32 = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number"))).unwrap_or(1.0);
+    let level_given: Option<f32> = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number")));
+    let level = level_given.unwrap_or(1.0);
+    let (mic_text, keep_text) = (take("--mic"), take("--keep"));
     let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
     let (shot, drag) = (take("--shot"), take("--drag"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
@@ -293,7 +302,7 @@ fn main() {
         }
         None => false,
     };
-    let (exclusive, shared) = (flag("--exclusive"), flag("--shared"));
+    let (exclusive, shared, measure_flag) = (flag("--exclusive"), flag("--shared"), flag("--measure"));
     let gains = Arc::new(Settings::default());
     let given = gains_text.map(|g| parse_gains(&g));
     given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
@@ -331,6 +340,8 @@ fn main() {
                 play: file.map(|f| (f, level)),
                 drag,
                 shot: shot.map(|path| (path, seconds.unwrap_or(4.0))),
+                mic: mic_text,
+                measure: measure_flag,
             };
             window::open(start).unwrap_or_else(|e| fail(&e));
         }
@@ -342,6 +353,39 @@ fn main() {
                     true => println!("{}. {}{plays}  ({} channels, {} Hz; shared blocks {:.2} ms, least {:.2} ms)", i + 1, o.name, o.channels, o.rate, ms(o.periods.0), ms(o.periods.1)),
                     false => println!("{}. {}{plays}", i + 1, o.name),
                 }
+            }
+            println!("microphones:");
+            for (i, m) in audio::inputs().unwrap_or_else(|e| fail(&e)).iter().enumerate() {
+                println!("{}. {}{}", i + 1, m.name, if m.default { format!("  [{} records here]", audio::SYSTEM) } else { String::new() });
+            }
+        }
+        Some("measure") => {
+            let mic = audio::find_input(&mic_text.unwrap_or_else(|| fail("give --mic <microphone> (see `bottle-eq devices`)"))).unwrap_or_else(|e| fail(&e));
+            let target = find(&to.clone().unwrap_or_else(|| fail("give --to <device>: the speakers the sweep is played out of"))).unwrap_or_else(|e| fail(&e));
+            // with a source the sweep is played to it and goes through the path and the equalizer as
+            // music does; without, straight to the speakers
+            let source = from.as_ref().map(|f| find(f).unwrap_or_else(|e| fail(&e)));
+            let running = source.as_ref().map(|source| {
+                let (mut equalizer, g) = (Eq::new(target.rate), gains.clone());
+                let running = run(source, &target, cushion_ms, !shared, |_, _| {}, move |sound, channels| equalizer.process(sound, channels, &g)).unwrap_or_else(|e| fail(&e));
+                describe(&running, source, &target);
+                show_gains(&gains, target.rate);
+                std::thread::sleep(Duration::from_millis(500));
+                running
+            });
+            println!("measuring with \"{}\": a sweep from 20 Hz to 20 kHz, about 15 seconds ...", mic.name);
+            let m = measure::measure(&mic, source.as_ref().unwrap_or(&target), level_given.unwrap_or(0.5)).unwrap_or_else(|e| fail(&e));
+            drop(running);
+            println!("the sweep arrived {:.2} s into the recording, {:.1} dB of what was sent; the recording's loudest sample: {} dB{}", m.arrived, m.level, db(m.peak).trim(), if m.peak >= 0.99 { "  (IT CLIPPED: turn the microphone down)" } else { "" });
+            println!("      Hz      dB   above the noise");
+            for i in (0..m.hz.len()).step_by(8) {
+                println!("  {:>6.0}  {:>+6.1}   {:>5.0} dB  {}", m.hz[i], m.db[i], m.over_noise[i], if m.certain[i] { "" } else { "?" });
+            }
+            println!("{:.0}% of the frequencies from 20 Hz to 20 kHz are clearly ({} dB) above the noise; \"?\" marks the others", 100.0 * m.share(), measure::CLEAR);
+            if let Some(path) = keep_text {
+                let rows: Vec<String> = (0..m.hz.len()).map(|i| format!("{:.2},{:.3},{},{:.1}", m.hz[i], m.db[i], m.certain[i] as u8, m.over_noise[i])).collect();
+                std::fs::write(&path, format!("hz,db,certain,above_noise_db\n{}\n", rows.join("\n"))).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+                println!("kept: {path}");
             }
         }
         Some("run") => {
@@ -573,6 +617,6 @@ fn main() {
                 println!("kept: {dir}/captured.wav (what came from the source), {dir}/handed.wav (what the target was given)");
             }
         }
-        _ => fail("commands: window | devices | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
+        _ => fail("commands: window | devices | measure --mic <microphone> --to <device> | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
     }
 }

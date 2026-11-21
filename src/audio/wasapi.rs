@@ -35,7 +35,7 @@
 //! The path: capture thread -> lock-free ring -> playback thread. Both threads run at the "Pro Audio"
 //! priority Windows keeps for this, wake on the device's own event, and never lock or allocate.
 
-use super::{bits, value, Meters, Opened, Output, Running};
+use super::{bits, value, Input, Meters, Opened, Output, Running};
 use crate::ring::Ring;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -43,9 +43,10 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use windows::core::{w, Result as Win, GUID, HSTRING};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Foundation::{E_ACCESSDENIED, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
+use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, CreateEventW, WaitForSingleObject, AVRT_PRIORITY_CRITICAL};
@@ -235,6 +236,76 @@ impl Reader {
         }
         m.played.fetch_add(frames, Ordering::Relaxed);
     }
+}
+
+/// Every active input endpoint (the microphones).
+pub fn inputs() -> Result<Vec<Input>, String> {
+    let list = || -> Win<Vec<Input>> {
+        unsafe {
+            let all = enumerator()?;
+            let default = all.GetDefaultAudioEndpoint(eCapture, eConsole).and_then(|d| d.GetId()).ok().map(|id| id.to_string().unwrap_or_default());
+            let found = all.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+            let mut out = Vec::new();
+            for i in 0..found.GetCount()? {
+                let device = found.Item(i)?;
+                let id = device.GetId()?.to_string().unwrap_or_default();
+                let name = device.OpenPropertyStore(STGM_READ)?.GetValue(&PKEY_Device_FriendlyName)?.to_string();
+                out.push(Input { default: default.as_deref() == Some(id.as_str()), id, name });
+            }
+            Ok(out)
+        }
+    };
+    list().map_err(|e| format!("listing the microphones: {e}"))
+}
+
+/// Record a microphone into `sound` (one channel: its channels' mean) until `stop`; its rate is said
+/// through `ready` once it runs. An ordinary shared-mode capture stream, woken by the device's event.
+pub fn listen_to(input: &Input, stop: &Arc<AtomicBool>, ready: &Sender<Result<u32, String>>, sound: &mut Vec<f32>) -> Result<(), String> {
+    let listen = |sound: &mut Vec<f32>| -> Win<()> {
+        unsafe {
+            let client: IAudioClient = device(&input.id)?.Activate(CLSCTX_ALL, None)?;
+            let format = client.GetMixFormat()?;
+            let (tag, ch, rate, bits) = ((*format).wFormatTag as u32, (*format).nChannels as usize, (*format).nSamplesPerSec, (*format).wBitsPerSample);
+            let sub: GUID = if tag == WAVE_FORMAT_EXTENSIBLE { (*(format as *const WAVEFORMATEXTENSIBLE)).SubFormat } else { GUID::zeroed() };
+            let float = tag == WAVE_FORMAT_IEEE_FLOAT || sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+            client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 2_000_000, 0, format, None)?;
+            let event = CreateEventW(None, false, false, None)?;
+            client.SetEventHandle(event)?;
+            let packets: IAudioCaptureClient = client.GetService()?;
+            client.Start()?;
+            let _ = ready.send(Ok(rate));
+            let most = 120 * rate as usize;
+            while !stop.load(Ordering::Relaxed) {
+                if WaitForSingleObject(event, 100) != WAIT_OBJECT_0 {
+                    continue;
+                }
+                while packets.GetNextPacketSize()? > 0 {
+                    let (mut data, mut n, mut flags) = (std::ptr::null_mut(), 0u32, 0u32);
+                    packets.GetBuffer(&mut data, &mut n, &mut flags, None, None)?;
+                    let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+                    for frame in 0..(n as usize).min(most.saturating_sub(sound.len())) {
+                        let sample = |c: usize| match (silent, float, bits) {
+                            (true, _, _) => 0.0,
+                            (_, true, 32) => *(data as *const f32).add(frame * ch + c),
+                            (_, false, 16) => *(data as *const i16).add(frame * ch + c) as f32 / 32768.0,
+                            (_, false, 32) => *(data as *const i32).add(frame * ch + c) as f32 / 2147483648.0,
+                            _ => 0.0,
+                        };
+                        sound.push((0..ch).map(sample).sum::<f32>() / ch as f32);
+                    }
+                    packets.ReleaseBuffer(n)?;
+                }
+            }
+            client.Stop()
+        }
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    listen(sound).map_err(|e| match e.code() == E_ACCESSDENIED {
+        true => "Windows does not let programs use the microphone: Settings > Privacy & security > Microphone > \"Let desktop apps access your microphone\"".to_string(),
+        false => format!("recording {}: {e}", input.name),
+    })
 }
 
 unsafe fn device(id: &str) -> Win<IMMDevice> {

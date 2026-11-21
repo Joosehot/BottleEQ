@@ -29,7 +29,7 @@
 //! The sound is 32-bit float, two channels, 48,000 Hz; where the graph runs at another rate PipeWire's
 //! own converter stands between.
 
-use super::{bits, value, Meters, Opened, Output, Running};
+use super::{bits, value, Input, Meters, Opened, Output, Running};
 use crate::ring::Ring;
 use pipewire as pw;
 use pw::properties::properties;
@@ -51,15 +51,17 @@ const QUANTUM: u32 = 128;
 /// the most frames taken from one block (a quantum is 8192 at the very most)
 const MOST: usize = 8192;
 
-/// The one format spoken: 32-bit float, two channels (left, right), 48,000 Hz.
-fn format() -> Vec<u8> {
+/// The one format spoken: 32-bit float at 48,000 Hz; two channels (left, right), or one.
+fn format(channels: usize) -> Vec<u8> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
     info.set_rate(RATE);
-    info.set_channels(CHANNELS as u32);
+    info.set_channels(channels as u32);
     let mut position = [0; spa::param::audio::MAX_CHANNELS];
-    position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
-    position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
+    match channels {
+        1 => position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO,
+        _ => (position[0], position[1]) = (spa::sys::SPA_AUDIO_CHANNEL_FL, spa::sys::SPA_AUDIO_CHANNEL_FR),
+    }
     info.set_position(position);
     let object = spa::pod::Object { type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(), id: spa::param::ParamType::EnumFormat.as_raw(), properties: info.into() };
     spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &spa::pod::Value::Object(object)).expect("the format is written").0.into_inner()
@@ -102,34 +104,34 @@ fn name_in(value: &str) -> Option<String> {
     Some(rest[..rest.find('"')?].to_string())
 }
 
-/// Bottle EQ's own device first (what is captured from), then every output device of the graph.
-pub fn outputs() -> Result<Vec<Output>, String> {
+/// The nodes of a class in the graph as (name, what it is called), and the name of the one the system
+/// uses by default (kept under `key` in the metadata called "default").
+fn nodes(class: &'static str, key: &'static str) -> Result<(Vec<(String, String)>, Option<String>), String> {
     let (mainloop, core) = connect()?;
     let registry = core.get_registry_rc().map_err(|e| e.to_string())?;
-    let sinks = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+    let found = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
     let default = Rc::new(RefCell::new(None::<String>));
     // the metadata objects bound, kept alive with their listeners until the answers are in
     let kept = Rc::new(RefCell::new(Vec::new()));
-    let (s, d, k, r) = (sinks.clone(), default.clone(), kept.clone(), registry.downgrade());
+    let (f, d, k, r) = (found.clone(), default.clone(), kept.clone(), registry.downgrade());
     let _listener = registry
         .add_listener_local()
         .global(move |global| {
             let Some(props) = global.props else { return };
             match global.type_ {
-                pw::types::ObjectType::Node if props.get("media.class") == Some("Audio/Sink") => {
+                pw::types::ObjectType::Node if props.get("media.class") == Some(class) => {
                     let name = props.get("node.name").unwrap_or_default().to_string();
                     let said = props.get("node.description").or(props.get("node.nick")).unwrap_or(&name).to_string();
-                    s.borrow_mut().push((name, said));
+                    f.borrow_mut().push((name, said));
                 }
-                // where the system plays is kept in the metadata called "default"
                 pw::types::ObjectType::Metadata if props.get("metadata.name") == Some("default") => {
                     let Some(registry) = r.upgrade() else { return };
                     if let Ok(metadata) = registry.bind::<pw::metadata::Metadata, _>(global) {
                         let d = d.clone();
                         let listener = metadata
                             .add_listener_local()
-                            .property(move |_, key, _, value| {
-                                if key == Some("default.audio.sink") {
+                            .property(move |_, name, _, value| {
+                                if name == Some(key) {
                                     *d.borrow_mut() = value.and_then(name_in);
                                 }
                                 0
@@ -145,11 +147,78 @@ pub fn outputs() -> Result<Vec<Output>, String> {
     // once for the objects, once more for what the metadata bound in the first holds
     roundtrip(&mainloop, &core)?;
     roundtrip(&mainloop, &core)?;
-    let default = default.borrow().clone();
+    let out = (found.borrow().clone(), default.borrow().clone());
+    Ok(out)
+}
+
+/// Bottle EQ's own device first (what is captured from), then every output device of the graph.
+pub fn outputs() -> Result<Vec<Output>, String> {
+    let (sinks, default) = nodes("Audio/Sink", "default.audio.sink")?;
     let device = |id: &str, name: String| Output { default: default.as_deref() == Some(id), id: id.to_string(), name, channels: CHANNELS, rate: RATE, periods: (0, 0) };
     let mut out = vec![device(OWN, "Bottle EQ (its own device, there while it runs)".to_string())];
-    out.extend(sinks.borrow().iter().filter(|(id, _)| id != OWN).map(|(id, name)| device(id, name.clone())));
+    out.extend(sinks.iter().filter(|(id, _)| id != OWN).map(|(id, name)| device(id, name.clone())));
     Ok(out)
+}
+
+/// The microphones (every input device of the graph).
+pub fn inputs() -> Result<Vec<Input>, String> {
+    let (sources, default) = nodes("Audio/Source", "default.audio.source")?;
+    Ok(sources.into_iter().map(|(id, name)| Input { default: default.as_deref() == Some(id.as_str()), id, name }).collect())
+}
+
+/// Record a microphone into `sound` (one channel) until `stop`; its rate is said through `ready` once
+/// the stream is made. A capture stream like any recording program's.
+pub fn listen_to(input: &Input, stop: &Arc<AtomicBool>, ready: &Sender<Result<u32, String>>, sound: &mut Vec<f32>) -> Result<(), String> {
+    let (mainloop, core) = connect()?;
+    let stream = pw::stream::StreamBox::new(
+        &core,
+        "bottle-eq-microphone",
+        properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Music",
+            *pw::keys::NODE_NAME => "bottle_eq_microphone",
+            *pw::keys::TARGET_OBJECT => input.id.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    // room for two minutes, made here so that the audio thread never has to ask for more
+    let most = 120 * RATE as usize;
+    let kept = Rc::new(RefCell::new(Vec::<f32>::with_capacity(most)));
+    let (k, said, sent) = (kept.clone(), ready.clone(), Cell::new(false));
+    let listener = stream
+        .add_local_listener_with_user_data(())
+        .state_changed(move |_, _, _, now| match now {
+            pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming if !sent.get() => {
+                sent.set(true);
+                let _ = said.send(Ok(RATE));
+            }
+            pw::stream::StreamState::Error(why) => {
+                let _ = said.send(Err(format!("the microphone: {why}")));
+            }
+            _ => {}
+        })
+        .process(move |stream, _| {
+            let Some(mut buffer) = stream.dequeue_buffer() else { return };
+            let Some(data) = buffer.datas_mut().first_mut() else { return };
+            let (from, size) = (data.chunk().offset() as usize, data.chunk().size() as usize);
+            let Some(bytes) = data.data() else { return };
+            let to = (from + size).min(bytes.len());
+            let mut kept = k.borrow_mut();
+            let room = most - kept.len();
+            kept.extend(bytes[from.min(to)..to].chunks_exact(4).take(room).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        })
+        .register()
+        .map_err(|e| e.to_string())?;
+    let bytes = format(1);
+    let flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS;
+    stream.connect(spa::utils::Direction::Input, None, flags, &mut [spa::pod::Pod::from_bytes(&bytes).expect("the format is read")]).map_err(|e| format!("recording {}: {e}", input.name))?;
+    let stop = stop.clone();
+    until_stopped(&mainloop, move || stop.load(Ordering::Relaxed));
+    let _ = stream.disconnect();
+    drop(listener);
+    sound.extend_from_slice(&kept.borrow());
+    Ok(())
 }
 
 /// The loop is left when `stop` is set: it is looked at twenty times a second.
@@ -316,7 +385,7 @@ fn path(
         .register()
         .map_err(|e| e.to_string())?;
 
-    let bytes = format();
+    let bytes = format(CHANNELS);
     let flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS;
     let pod = || spa::pod::Pod::from_bytes(&bytes).expect("the format is read");
     capture.connect(spa::utils::Direction::Input, None, flags, &mut [pod()]).map_err(|e| format!("making Bottle EQ's own device: {e}"))?;
@@ -420,7 +489,7 @@ pub fn play(output: &Output, sound: Vec<f32>) -> JoinHandle<()> {
                 })
                 .register()
                 .map_err(|e| e.to_string())?;
-            let bytes = format();
+            let bytes = format(CHANNELS);
             let flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS;
             stream.connect(spa::utils::Direction::Output, None, flags, &mut [spa::pod::Pod::from_bytes(&bytes).expect("the format is read")]).map_err(|e| e.to_string())?;
             until_stopped(&mainloop, move || after.get() > 3 * RATE as usize / 10);

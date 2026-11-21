@@ -10,6 +10,9 @@
 //! - **Right button on a point**: its kind (a slope at the start or the end, a shelf, a peak, a spike),
 //!   or take it away. **Right button or double click on the empty graph**: a new point there.
 //! - **Flat** puts the bands and the points back to nothing: the sound passes as it came.
+//! - **Measure** plays a sweep out of the speakers and records it with the microphone chosen
+//!   (`measure.rs`); what reached the microphone is drawn in blue on the curve's scale, dotted where it
+//!   is not clearly above the noise. It can be measured again at any time; the line is the last one.
 //!
 //! The sound changes while a handle is dragged: the curve goes to the audio thread through `Settings`
 //! (atomics) at every move, and the audio thread slides to it. The audio thread never waits for the
@@ -22,7 +25,8 @@ use eframe::egui::{self, pos2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 use crate::eq::{self, Curve, Eq, Kind, Mode, Point, Settings, BANDS, CENTRES, CUT_Q, MOST, POINTS, POINT_Q};
 use crate::ring::Ring;
 use crate::spectrum::{Spectrum, SIZE};
-use crate::audio::{self, run, Output, Running};
+use crate::audio::{self, run, Input, Output, Running};
+use crate::measure::{self, Measured};
 
 /// the graph's edges: frequencies, the curve's dB each way, the spectrum's lowest level
 const LOW: f32 = 20.0;
@@ -36,6 +40,9 @@ const SPIKE_Q: f32 = 6.0;
 
 const AMBER: Color32 = Color32::from_rgb(255, 190, 80);
 const GREEN: Color32 = Color32::from_rgb(70, 190, 130);
+const BLUE: Color32 = Color32::from_rgb(110, 175, 255);
+/// how loud the sweep is sent, of the most there is
+const SWEEP: f32 = 0.5;
 
 /// How the window is opened.
 pub struct Start {
@@ -51,6 +58,9 @@ pub struct Start {
     pub play: Option<(String, f32)>,
     pub drag: Option<(usize, f32, f32)>,
     pub shot: Option<(String, f32)>,
+    /// the microphone, and whether to measure by itself a second after opening
+    pub mic: Option<String>,
+    pub measure: bool,
 }
 
 /// The points a curve starts from: one at each end and one between (each between two bands), all at 0 dB.
@@ -161,6 +171,14 @@ struct Window {
     drag_step: usize,
     shot: Option<(String, f32)>,
     shot_asked: bool,
+    // measuring
+    inputs: Vec<Input>,
+    mic: Option<usize>,
+    /// a measurement under way: where its result comes, and when it began
+    measuring: Option<(std::sync::mpsc::Receiver<Result<Measured, String>>, Instant)>,
+    measured: Option<Measured>,
+    measure_said: String,
+    measure_soon: bool,
 }
 
 impl Window {
@@ -295,6 +313,62 @@ impl Window {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Microphone");
+            let name = self.mic.map_or("none".to_string(), |i| self.inputs[i].name.clone());
+            ui.add_enabled_ui(self.measuring.is_none(), |ui| {
+                egui::ComboBox::from_id_salt("mic").width(190.0).selected_text(name).show_ui(ui, |ui| {
+                    for (i, input) in self.inputs.iter().enumerate() {
+                        ui.selectable_value(&mut self.mic, Some(i), input.name.clone());
+                    }
+                });
+                let button = ui.button(if self.measured.is_some() { "Measure again" } else { "Measure" }).on_hover_text(
+                    "Plays a sweep from 20 Hz to 20 kHz out of the speakers (about 15 seconds, loud) and records it with the microphone: put the microphone where you listen, and pause the music first.\nThe blue line is what reached the microphone: speakers, room and microphone together.",
+                );
+                if button.clicked() {
+                    self.measure();
+                }
+            });
+            let text = match &self.measuring {
+                Some((_, began)) => format!("measuring: keep quiet ... {:.0} s", (measure::BEFORE + measure::SECONDS + measure::AFTER + 1.0 - began.elapsed().as_secs_f64()).max(0.0)),
+                None => self.measure_said.clone(),
+            };
+            ui.label(egui::RichText::new(text).small());
+        });
+    }
+
+    /// Begin a measurement: the sweep goes where music goes. While the path runs that is its source,
+    /// so the sweep passes the equalizer as it is set; else it is played straight to the speakers.
+    fn measure(&mut self) {
+        let (Some(mic), Some(target)) = (self.mic, self.target) else {
+            self.measure_said = "choose a microphone, and the speakers to play to (to)".to_string();
+            return;
+        };
+        let play_to = match (&self.running, self.source) {
+            (Some(_), Some(source)) => self.outputs[source].clone(),
+            _ => self.outputs[target].clone(),
+        };
+        let (said, heard) = std::sync::mpsc::channel();
+        let input = self.inputs[mic].clone();
+        std::thread::spawn(move || {
+            let _ = said.send(measure::measure(&input, &play_to, SWEEP));
+        });
+        self.measuring = Some((heard, Instant::now()));
+    }
+
+    /// Take a measurement's result when it has come.
+    fn measured(&mut self) {
+        let Some((heard, _)) = &self.measuring else { return };
+        match heard.try_recv() {
+            Ok(Ok(m)) => {
+                let clipped = if m.peak >= 0.99 { "; THE MICROPHONE CLIPPED: turn it down and measure again" } else { "" };
+                self.measure_said = format!("measured: {:.0}% clearly above the noise{clipped}", 100.0 * m.share());
+                (self.measured, self.measuring) = (Some(m), None);
+            }
+            Ok(Err(why)) => (self.measure_said, self.measuring) = (why, None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => (self.measure_said, self.measuring) = ("the measurement broke off".to_string(), None),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     fn bottom_rows(&mut self, ui: &mut egui::Ui) {
@@ -369,6 +443,21 @@ impl Window {
             line.push(pos2(x, y));
         }
         painter.line(line, Stroke::new(2.0, GREEN));
+
+        // what was measured at the microphone, on the curve's scale: whole where it is clearly above
+        // the noise, dotted where it is not
+        if let Some(m) = &self.measured {
+            // not held at the graph's edge as the curve is: what is weaker than the graph shows leaves it
+            let at = |i: usize| pos2(x_of(graph, m.hz[i]), graph.center().y - m.db[i] / SPAN * graph.height() / 2.0);
+            for i in 1..m.hz.len() {
+                match m.certain[i - 1] && m.certain[i] {
+                    true => drop(painter.line_segment([at(i - 1), at(i)], Stroke::new(2.0, BLUE))),
+                    false if i % 3 == 0 => drop(painter.line_segment([at(i - 1), at(i)], Stroke::new(1.5, BLUE.gamma_multiply(0.6)))),
+                    false => {}
+                }
+            }
+            painter.text(pos2(graph.left() + 6.0, graph.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, "blue: measured at the microphone (dotted: not clearly above the noise)", small.clone(), BLUE);
+        }
 
         // the pointer and the handles
         let curve = self.settings.get();
@@ -548,6 +637,11 @@ impl eframe::App for Window {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.spectrum.take(&self.ring);
         self.spectrum.look(ui.input(|i| i.stable_dt).min(0.1));
+        self.measured();
+        if self.measure_soon && self.opened.elapsed().as_secs_f32() > 1.0 {
+            self.measure_soon = false;
+            self.measure();
+        }
         if self.looked.elapsed().as_secs_f32() > 0.5 {
             self.looked = Instant::now();
             if let Some(running) = &self.running {
@@ -611,6 +705,9 @@ pub fn open(start: Start) -> Result<(), String> {
     let mode = start.mode.and_then(|name| eq::mode(&name).ok()).map_or(String::new(), |m| m.name);
     // Linux: nothing is taken from anyone by starting, so it starts as soon as it knows where to play
     let begin = (start.exclusive.is_some() || cfg!(target_os = "linux")) && source.is_some() && target.is_some();
+    let inputs = std::thread::spawn(audio::inputs).join().map_err(|_| "the microphones could not be listed".to_string())?.unwrap_or_default();
+    let wanted = start.mic.as_ref().map(|m| m.to_lowercase());
+    let mic = wanted.and_then(|w| inputs.iter().position(|i| i.name.to_lowercase().contains(&w))).or(inputs.iter().position(|i| i.default)).or((!inputs.is_empty()).then_some(0));
     let mut window = Window {
         outputs,
         source,
@@ -637,12 +734,18 @@ pub fn open(start: Start) -> Result<(), String> {
         drag_step: 0,
         shot: start.shot,
         shot_asked: false,
+        inputs,
+        mic,
+        measuring: None,
+        measured: None,
+        measure_said: String::new(),
+        measure_soon: start.measure,
     };
     if begin {
         window.start();
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([700.0, 400.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
+        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([700.0, 430.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
         ..Default::default()
     };
     eframe::run_native("Bottle EQ", options, Box::new(move |made| {

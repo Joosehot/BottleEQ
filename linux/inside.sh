@@ -17,6 +17,12 @@ echo "== playtest, ten bands"
 $B playtest --to speakers --file test/pink.wav --level 0.5 --gains 6,0,-4,0,3,-6,0,4,0,-3 --record test/linux/bands
 echo "== playtest, a mode and points"
 $B playtest --to speakers --file test/pink.wav --level 0.5 --mode "bass boost" --points "100:cut:1.5 1k:-2 12k:+8:spike" --record test/linux/points
+echo "== measuring: a microphone that hears just what the speakers are given"
+pw-loopback --capture-props='stream.capture.sink=true target.object=speakers node.name=hears' --playback-props='media.class=Audio/Source node.name=mic node.description="Microphone (hears the speakers)"' >/tmp/loopback.log 2>&1 &
+sleep 1
+$B devices
+$B measure --mic mic --to speakers --keep test/linux/measured_flat.csv | tail -3
+$B measure --mic mic --to speakers --gains 6,0,-4,0,3,-6,0,4,0,-3 --keep test/linux/measured_bands.csv | tail -3
 echo "== the window"
 Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 &
 sleep 1
