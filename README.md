@@ -244,7 +244,20 @@ it): within reach 160 frequencies from 82 Hz to 8.1 kHz; the curve lies 0.46 dB 
 (2.57 dB at the most); **from flat: 3.88 dB before, 0.95 dB after** (the careful way: 3.90 to 1.76).
 It took 7.3 dB of headroom. Kept as the calibration "Speakers exact". Not yet listened to.
 
-**Save** keeps the curve under a name ("Speakers", "Headphones") with the devices, the day and the
+**The correction lies under the curve.** It is a curve of its own in the equalizer (ten bands and up to
+24 points, like the one set by hand), run before it. A mode, the bands and the points are put on top of
+it and leave it as it is, and so does Flat; choosing another calibration (or "none") changes it, and the
+tick beside the list leaves it out for a moment, to hear what it does. In the window it is the thin pale
+line; from the keyboard `--calibration <name>`, and while `run` plays `calibration <name>` and
+`calibration none`. (Before this a mode set the same ten bands a calibration had set, and half the
+correction was gone.) A measurement takes off all that the sweep went through, the correction and the
+curve on top alike, so Correct can be pressed with a mode on. Checked: at six frequencies the sound
+through a correction with a mode on it comes out at what the two curves say together, within 0.05 dB;
+flat takes the mode away and leaves the correction; in the running path (pink noise, the calibration
+"Speakers exact" with the mode Rock on it) the sound is what the two say together: mean difference
+0.09 dB, biggest 0.81 dB at 80 Hz, on the flank of the correction's narrowest peak.
+
+**Save** keeps the correction under a name ("Speakers", "Headphones") with the devices, the day and the
 measurement it was made from: a file in the folder `calibrations` where Bottle EQ is run from. The list
 beside it sets one that was kept; so does `--calibration <name>` for `run` and the window.
 

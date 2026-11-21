@@ -14,10 +14,13 @@
 //!   (`measure.rs`); what reached the microphone is drawn in blue on the curve's scale, dotted where it
 //!   is not to be believed. It can be measured again at any time; the line is the last one.
 //! - **Correct** turns the last measurement over into the equalizer's curve (`calibrate.rs`), so that
-//!   what reaches the microphone becomes flat: the amber curve is then the correction, the faint blue
-//!   line what was measured before it, the white dashes at 0 dB the flat that is aimed at. Measure
+//!   what reaches the microphone becomes flat: the thin pale curve is then the correction, the faint
+//!   blue line what was measured before it, the white dashes at 0 dB the flat that is aimed at. Measure
 //!   again to see how near it came. **Save** keeps the curve as a calibration by name; the list beside
 //!   it sets one that was kept.
+//! - **The correction lies under the curve**: it is a curve of its own (drawn thin and pale), and the
+//!   mode, the bands and the points are put on top of it. Changing them, or Flat, leaves it as it is;
+//!   the calibration list sets another or none, and the tick beside it leaves it out for a moment.
 //! - **Quick guess** measures with one sweep only, fills in what that leaves open from what curves of
 //!   the same kind of device look like (`guess.rs`), and corrects at once. What was guessed is drawn
 //!   in violet dashes, apart from the blue that was measured. Measure again to see how near flat it came.
@@ -74,6 +77,8 @@ pub struct Start {
     pub measure: bool,
     /// and then correct and measure again, by itself
     pub correct: bool,
+    /// the calibration that was set as the correction before opening, by name
+    pub calibration: Option<String>,
     /// the careful way of correcting, not the exact mirror
     pub gentle: bool,
     /// the first measurement is a quick guess; and the kind of device
@@ -403,16 +408,26 @@ impl Window {
             ui.label("Calibration");
             let shown = if self.calibration.is_empty() { "none".to_string() } else { self.calibration.clone() };
             let mut chosen = None;
+            let mut none = false;
             egui::ComboBox::from_id_salt("calibration").width(150.0).selected_text(shown).show_ui(ui, |ui| {
+                none = ui.selectable_label(self.calibration.is_empty(), "none").clicked();
                 for c in &self.calibrations {
                     if ui.selectable_label(self.calibration == c.name, format!("{}  ({}, {})", c.name, c.device, c.day)).clicked() {
                         chosen = Some(c.clone());
                     }
                 }
             });
+            if none {
+                // the correction is taken away; the curve on top stays
+                self.settings.set_correction(&[0.0; BANDS], &[]);
+                (self.before, self.calibration) = (None, String::new());
+            }
+            let mut correcting = self.settings.correcting.load(Ordering::Relaxed);
+            if ui.checkbox(&mut correcting, "on").on_hover_text("The correction lies under the curve: a mode, the bands and the points are put on top of it, and Flat leaves it as it is.\nUnticked: the correction is left out, to hear what it does.").changed() {
+                self.settings.correcting.store(correcting, Ordering::Relaxed);
+            }
             if let Some(c) = chosen {
                 c.set(&self.settings);
-                self.mode.clear();
                 self.before = (!c.hz.is_empty()).then(|| (c.hz.clone(), c.raw.clone(), vec![true; c.hz.len()]));
                 self.before_measured = c.certain.clone();
                 self.kind = c.kind.clone();
@@ -447,10 +462,9 @@ impl Window {
             return;
         }
         let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, self.rate(), how);
-        self.settings.set_all(&fitted.gains);
-        self.settings.set_points(&fitted.points);
-        self.mode.clear();
-        self.calibration.clear();
+        // it is set under the curve: the mode and the points on top stay as they are
+        self.settings.set_correction(&fitted.gains, &fitted.points);
+        self.calibration = "not saved".to_string();
         let alone = calibrate::raw(m);
         let from_flat = calibrate::spread(&alone, &want.reach);
         self.before_measured = (0..m.hz.len()).map(|i| m.certain[i] && !m.guessed.get(i).copied().unwrap_or(false)).collect();
@@ -466,7 +480,7 @@ impl Window {
             self.measure_said = "give the calibration a name (Speakers, Headphones ...)".to_string();
             return;
         }
-        let set = self.settings.get();
+        let set = self.settings.correction();
         // what was guessed is not kept as measured: the guesser must not learn from its own guesses
         let (hz, raw, _) = self.before.clone().unwrap_or_default();
         let certain = if self.before_measured.len() == hz.len() { self.before_measured.clone() } else { vec![false; hz.len()] };
@@ -506,11 +520,11 @@ impl Window {
         let (said, heard) = std::sync::mpsc::channel();
         let input = self.inputs[mic].clone();
         // the curve the sweep goes through: the one set, when the path runs and the equalizer is on
-        let through = (self.running.is_some() && self.settings.on.load(Ordering::Relaxed)).then(|| self.settings.get());
+        let through = if self.running.is_some() { self.settings.passed().to_vec() } else { Vec::new() };
         std::thread::spawn(move || {
             let _ = said.send(match short {
-                true => measure::short(&input, &play_to, SWEEP, through.as_ref()),
-                false => measure::measure(&input, &play_to, SWEEP, through.as_ref()),
+                true => measure::short(&input, &play_to, SWEEP, &through),
+                false => measure::measure(&input, &play_to, SWEEP, &through),
             });
         });
         self.measuring = Some((heard, Instant::now(), short));
@@ -565,7 +579,7 @@ impl Window {
                     "delay {:.1} ms (longest {:.1})   turned down {:.1} dB for headroom   gaps {}{limited}",
                     self.delay.0,
                     self.delay.1,
-                    if self.settings.on.load(Ordering::Relaxed) { -self.settings.get().headroom(self.rate()) } else { 0.0 },
+                    -self.settings.headroom(self.rate()),
                     m.dry.load(Ordering::Relaxed) + m.dropped.load(Ordering::Relaxed)
                 )
             }
@@ -747,6 +761,14 @@ impl Window {
             })
             .collect();
         let colour = if on { AMBER } else { Color32::from_gray(120) };
+        // the correction under it: a curve of its own, thin and pale, with no handles
+        let lies_under = self.settings.correction();
+        if lies_under != Curve::default() {
+            let pale = if on && self.settings.correcting.load(Ordering::Relaxed) { Color32::from_rgb(235, 215, 170) } else { Color32::from_gray(95) };
+            let line: Vec<Pos2> = (0..=across).map(|step| pos2(graph.left() + step as f32 * 2.0, y_of(graph, lies_under.response_db(rate, hz_at(graph, graph.left() + step as f32 * 2.0) as f64)))).collect();
+            painter.line(line, Stroke::new(1.5, pale));
+            painter.text(pos2(graph.right() - 6.0, graph.bottom() - 4.0), egui::Align2::RIGHT_BOTTOM, "pale: the correction, under the curve", small.clone(), pale);
+        }
         // between the 0 dB line and the curve it is filled: above the line that much louder, below quieter
         let zero = y_of(graph, 0.0);
         for at in &drawn {
@@ -965,6 +987,11 @@ pub fn open(start: Start) -> Result<(), String> {
         calibration: String::new(),
         save_as: String::new(),
     };
+    // a calibration set before opening: named in the list, with the measurement it was made from
+    if let Some(c) = start.calibration.and_then(|name| calibrate::calibration(&name).ok()) {
+        window.before = (!c.hz.is_empty()).then(|| (c.hz.clone(), c.raw.clone(), vec![true; c.hz.len()]));
+        (window.before_measured, window.kind, window.save_as, window.calibration) = (c.certain.clone(), c.kind.clone(), c.name.clone(), c.name);
+    }
     if begin {
         window.start();
     }

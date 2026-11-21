@@ -25,6 +25,12 @@
 //! audio thread moves each gain, frequency and width a step per block toward what is set and makes
 //! that filter anew.
 //!
+//! **Two curves, one on the other.** Under the curve that is set by hand (the bands, a mode, the
+//! points) there can lie a *correction*: a second curve of the same make (ten bands and points), set
+//! from a calibration, that makes the speakers flat. The two are run one after the other, so a mode or
+//! a point is put on speakers that are already set right, and changing or flattening the curve on top
+//! leaves the correction as it is.
+//!
 //! So that a raised curve cannot clip, the whole sound is turned down by the curve's highest point
 //! (`headroom`).
 //!
@@ -139,11 +145,19 @@ impl Point {
 }
 
 /// A whole curve: the ten bands' gains and the points.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Curve {
     pub gains: [f32; BANDS],
     points: [Point; POINTS],
     count: usize,
+}
+
+/// Two curves are the same when their bands and the points they have are (not the places kept for
+/// points they have not).
+impl PartialEq for Curve {
+    fn eq(&self, other: &Curve) -> bool {
+        self.gains == other.gains && self.points() == other.points()
+    }
 }
 
 impl Default for Curve {
@@ -177,11 +191,17 @@ impl Curve {
     }
 
     /// How far the whole sound is turned down so that the curve's highest point is at 0 dB: 0 or less.
+    #[cfg(test)]
     pub fn headroom(&self, rate: f64) -> f32 {
-        // the curve, looked at every twelfth of an octave from 20 Hz up, and at every band and point
+        self.headroom_on(&Curve::default(), rate)
+    }
+
+    /// The same for this curve on another (a correction under it): by the highest point of the two together.
+    pub fn headroom_on(&self, under: &Curve, rate: f64) -> f32 {
+        // the curves, looked at every twelfth of an octave from 20 Hz up, and at every band and point
         let between = (0..121).map(|i| 20.0 * 2f64.powf(i as f64 / 12.0));
-        let at = between.chain(CENTRES.iter().map(|c| *c as f64)).chain(self.points().iter().map(|p| p.hz as f64));
-        -at.map(|hz| self.response_db(rate, hz.min(0.49 * rate))).fold(0.0f32, f32::max)
+        let at = between.chain(CENTRES.iter().map(|c| *c as f64)).chain(self.points().iter().chain(under.points()).map(|p| p.hz as f64));
+        -at.map(|hz| self.response_db(rate, hz.min(0.49 * rate)) + under.response_db(rate, hz.min(0.49 * rate))).fold(0.0f32, f32::max)
     }
 }
 
@@ -224,14 +244,60 @@ pub fn mode(wanted: &str) -> Result<Mode, String> {
     found.cloned().ok_or(format!("no mode is called \"{wanted}\" (there are: {})", all.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
-/// The curve as it is set, by whoever sets it (a window, the keyboard); read by the audio thread.
-pub struct Settings {
+const KINDS: [Kind; 5] = [Kind::LowCut, Kind::LowShelf, Kind::Peak, Kind::HighShelf, Kind::HighCut];
+
+/// A curve as it is kept for the audio thread to read: a few atomics.
+struct Kept {
     gains: [AtomicU32; BANDS],
     /// each point's frequency, gain, width and kind (0: by its place)
     points: [[AtomicU32; 4]; POINTS],
     count: AtomicUsize,
+}
+
+impl Default for Kept {
+    fn default() -> Kept {
+        Kept { gains: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())), points: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))), count: AtomicUsize::new(0) }
+    }
+}
+
+impl Kept {
+    fn set_all(&self, gains: &[f32; BANDS]) {
+        gains.iter().enumerate().for_each(|(b, g)| self.gains[b].store(g.clamp(-MOST, MOST).to_bits(), Ordering::Relaxed));
+    }
+
+    fn set_points(&self, points: &[Point]) {
+        for (slot, p) in self.points.iter().zip(points) {
+            slot[0].store(p.hz.clamp(10.0, 22000.0).to_bits(), Ordering::Relaxed);
+            slot[1].store(p.db.clamp(-MOST, MOST).to_bits(), Ordering::Relaxed);
+            slot[2].store(p.q.clamp(0.1, 20.0).to_bits(), Ordering::Relaxed);
+            slot[3].store(p.kind.map_or(0, |k| 1 + KINDS.iter().position(|x| *x == k).unwrap() as u32), Ordering::Relaxed);
+        }
+        self.count.store(points.len().min(POINTS), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Curve {
+        let f = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
+        Curve {
+            gains: std::array::from_fn(|b| f(&self.gains[b])),
+            points: std::array::from_fn(|i| {
+                let slot = &self.points[i];
+                Point { hz: f(&slot[0]), db: f(&slot[1]), q: f(&slot[2]), kind: slot[3].load(Ordering::Relaxed).checked_sub(1).map(|k| KINDS[k as usize % 5]) }
+            }),
+            count: self.count.load(Ordering::Relaxed).min(POINTS),
+        }
+    }
+}
+
+/// What is set, by whoever sets it (a window, the keyboard); read by the audio thread.
+pub struct Settings {
+    /// the curve set by hand: the bands (a mode) and the points
+    own: Kept,
+    /// the correction under it (a calibration); all at 0 when there is none
+    under: Kept,
     /// false: the sound passes untouched whatever is set
     pub on: AtomicBool,
+    /// false: the correction is left out (to hear what it does)
+    pub correcting: AtomicBool,
     /// the volume in dB, and the most the limiter held the sound back since it was last asked, in dB
     volume: AtomicU32,
     limited: AtomicU32,
@@ -239,22 +305,13 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings {
-            gains: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())),
-            points: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
-            count: AtomicUsize::new(0),
-            on: AtomicBool::new(true),
-            volume: AtomicU32::new(0f32.to_bits()),
-            limited: AtomicU32::new(0f32.to_bits()),
-        }
+        Settings { own: Kept::default(), under: Kept::default(), on: AtomicBool::new(true), correcting: AtomicBool::new(true), volume: AtomicU32::new(0f32.to_bits()), limited: AtomicU32::new(0f32.to_bits()) }
     }
 }
 
-const KINDS: [Kind; 5] = [Kind::LowCut, Kind::LowShelf, Kind::Peak, Kind::HighShelf, Kind::HighCut];
-
 impl Settings {
     pub fn set(&self, band: usize, db: f32) {
-        self.gains[band].store(db.clamp(-MOST, MOST).to_bits(), Ordering::Relaxed);
+        self.own.gains[band].store(db.clamp(-MOST, MOST).to_bits(), Ordering::Relaxed);
     }
 
     /// The volume in dB: 0 leaves the sound's level as it is.
@@ -272,33 +329,50 @@ impl Settings {
     }
 
     pub fn set_all(&self, gains: &[f32; BANDS]) {
-        gains.iter().enumerate().for_each(|(b, g)| self.set(b, *g));
+        self.own.set_all(gains);
     }
 
     /// The points of the curve (at most `POINTS`; more are left out).
     pub fn set_points(&self, points: &[Point]) {
-        for (slot, p) in self.points.iter().zip(points) {
-            slot[0].store(p.hz.clamp(10.0, 22000.0).to_bits(), Ordering::Relaxed);
-            slot[1].store(p.db.clamp(-MOST, MOST).to_bits(), Ordering::Relaxed);
-            slot[2].store(p.q.clamp(0.1, 20.0).to_bits(), Ordering::Relaxed);
-            slot[3].store(p.kind.map_or(0, |k| 1 + KINDS.iter().position(|x| *x == k).unwrap() as u32), Ordering::Relaxed);
-        }
-        self.count.store(points.len().min(POINTS), Ordering::Relaxed);
+        self.own.set_points(points);
     }
 
+    /// The curve set by hand.
     pub fn get(&self) -> Curve {
-        let f = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
-        Curve {
-            gains: std::array::from_fn(|b| f(&self.gains[b])),
-            points: std::array::from_fn(|i| {
-                let slot = &self.points[i];
-                Point { hz: f(&slot[0]), db: f(&slot[1]), q: f(&slot[2]), kind: slot[3].load(Ordering::Relaxed).checked_sub(1).map(|k| KINDS[k as usize % 5]) }
-            }),
-            count: self.count.load(Ordering::Relaxed).min(POINTS),
-        }
+        self.own.get()
     }
 
-    /// The flat curve: every band at 0 dB, every point at 0 dB where it is, and no cut.
+    /// The correction under the curve: its bands and its points. It stays until another is set.
+    pub fn set_correction(&self, gains: &[f32; BANDS], points: &[Point]) {
+        self.under.set_all(gains);
+        self.under.set_points(points);
+    }
+
+    /// The correction that is set (all at 0 dB and no point: none).
+    pub fn correction(&self) -> Curve {
+        self.under.get()
+    }
+
+    /// The two curves as the sound passes them now: (the one set by hand, the correction), each
+    /// nothing when it is switched off.
+    pub fn passed(&self) -> [Curve; 2] {
+        let on = self.on.load(Ordering::Relaxed);
+        [if on { self.own.get() } else { Curve::default() }, if on && self.correcting.load(Ordering::Relaxed) { self.under.get() } else { Curve::default() }]
+    }
+
+    /// How many dB the sound is changed at a frequency by all that it passes now.
+    pub fn response_db(&self, rate: f64, hz: f64) -> f32 {
+        self.passed().iter().map(|c| c.response_db(rate, hz)).sum()
+    }
+
+    /// How far the whole sound is turned down for headroom now: 0 or less.
+    pub fn headroom(&self, rate: f64) -> f32 {
+        let [own, under] = self.passed();
+        own.headroom_on(&under, rate)
+    }
+
+    /// The flat curve: every band at 0 dB, every point at 0 dB where it is, and no cut. The correction
+    /// under it is left as it is.
     pub fn flat(&self) {
         self.set_all(&[0.0; BANDS]);
         let flat: Vec<Point> = self.get().points().iter().map(|p| Point { db: 0.0, kind: p.kind.filter(|k| !k.is_cut()), ..*p }).collect();
@@ -328,39 +402,44 @@ struct Filter {
 /// The equalizer as the audio thread runs it.
 pub struct Eq {
     rate: f64,
-    /// the ten bands, then the points
-    filters: [Filter; BANDS + POINTS],
+    /// the curve set by hand (its ten bands, then its points), then the correction (the same)
+    filters: [Filter; 2 * EACH],
     /// the whole sound's gain now, in dB (the headroom and the volume, on their way), and the headroom
     /// of the curve last seen
     level: f32,
-    seen: Curve,
+    seen: [Curve; 2],
     room: f32,
     /// the limiter: what the sound is held back to now (1: not at all)
     held: f64,
     /// memory[channel][filter]
-    memory: Vec<[Memory; BANDS + POINTS]>,
+    memory: Vec<[Memory; 2 * EACH]>,
 }
+
+/// the filters of one curve
+const EACH: usize = BANDS + POINTS;
 
 impl Eq {
     pub fn new(rate: u32) -> Eq {
         let rate = rate as f64;
         let filters = std::array::from_fn(|i| {
+            let i = i % EACH;
             let (kind, hz, q) = if i < BANDS { (band_kind(i), CENTRES[i], BAND_Q) } else { (Kind::Peak, 1000.0, POINT_Q) };
             Filter { kind, hz, db: 0.0, q, coef: coef(kind, hz, 0.0, q, rate), live: false }
         });
-        Eq { rate, filters, level: 0.0, seen: Curve::default(), room: 0.0, held: 1.0, memory: Vec::new() }
+        Eq { rate, filters, level: 0.0, seen: [Curve::default(); 2], room: 0.0, held: 1.0, memory: Vec::new() }
     }
 
     /// One block of interleaved frames, equalized in place toward the curve set.
     pub fn process(&mut self, sound: &mut [f32], channels: usize, settings: &Settings) {
         if self.memory.len() != channels {
-            self.memory = vec![[Memory::default(); BANDS + POINTS]; channels];
+            self.memory = vec![[Memory::default(); 2 * EACH]; channels];
         }
-        let set = if settings.on.load(Ordering::Relaxed) { settings.get() } else { Curve::default() };
-        for i in 0..BANDS + POINTS {
+        let sets = settings.passed();
+        for i in 0..2 * EACH {
             // what this filter is set to be: (kind, frequency, gain, width), or nothing (a point not there)
-            let want = match i.checked_sub(BANDS) {
-                None => Some((band_kind(i), CENTRES[i], set.gains[i], BAND_Q)),
+            let (set, at) = (&sets[i / EACH], i % EACH);
+            let want = match at.checked_sub(BANDS) {
+                None => Some((band_kind(at), CENTRES[at], set.gains[at], BAND_Q)),
                 Some(p) if p < set.count => Some((set.kind(p), set.points[p].hz, set.points[p].db, set.points[p].q)),
                 Some(_) => None,
             };
@@ -388,8 +467,8 @@ impl Eq {
                 f.coef = coef(f.kind, f.hz, f.db, f.q, self.rate);
             }
         }
-        if set != self.seen {
-            (self.seen, self.room) = (set, set.headroom(self.rate));
+        if sets != self.seen {
+            (self.seen, self.room) = (sets, sets[0].headroom_on(&sets[1], self.rate));
         }
         let level_before = self.level;
         // the volume moves four times as fast as a curve's gain: it is a knob that is turned
@@ -616,6 +695,41 @@ mod tests {
         let mut again = sine(440.0, 3.0);
         again.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
         assert!(again[96000..] == sine(440.0, 3.0)[96000..], "two seconds after the volume is back at 0 the sound is not yet as it came");
+    }
+
+    #[test]
+    fn a_correction_lies_under_the_curve_and_stays_when_the_curve_is_changed() {
+        let settings = Settings::default();
+        let correction = [0.0, 0.0, -4.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0];
+        settings.set_correction(&correction, &[Point { hz: 3000.0, db: -6.0, q: 4.0, kind: Some(Kind::Peak) }]);
+        let alone = |hz: f64| settings.correction().response_db(R, hz);
+        assert!(alone(3000.0) < -3.0 && alone(2000.0) > 3.0 && settings.get() == Curve::default());
+        // a mode on top: the two add up, in what is said and in the sound
+        let rock = [4.0, 3.0, 0.0, -2.0, -1.0, 0.0, 2.0, 3.0, 4.0, 4.0];
+        settings.set_all(&rock);
+        for hz in [60.0, 125.0, 1000.0, 2000.0, 3000.0, 8000.0] {
+            assert!((settings.response_db(R, hz) - alone(hz) - settings.get().response_db(R, hz)).abs() < 1e-4);
+            let mut eq = Eq::new(RATE);
+            let mut sound = sine(hz, 1.0);
+            sound.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
+            let came = 20.0 * (rms(&sound[24000..]) / rms(&sine(hz, 1.0)[24000..])).log10();
+            let said = (settings.response_db(R, hz) + settings.headroom(R)) as f64;
+            assert!((came - said).abs() < 0.05, "at {hz} Hz the sound came out at {came} dB, the two curves say {said} dB");
+        }
+        // flat: the mode goes, the correction stays
+        settings.flat();
+        assert!(settings.get() == Curve::default() && (settings.response_db(R, 3000.0) - alone(3000.0)).abs() < 1e-4 && alone(3000.0) < -3.0);
+        // the correction left out, and all of it off: nothing; back on, it is there again
+        settings.correcting.store(false, Ordering::Relaxed);
+        assert_eq!((settings.response_db(R, 3000.0), settings.headroom(R)), (0.0, 0.0));
+        settings.correcting.store(true, Ordering::Relaxed);
+        settings.on.store(false, Ordering::Relaxed);
+        assert_eq!(settings.response_db(R, 3000.0), 0.0);
+        settings.on.store(true, Ordering::Relaxed);
+        assert!(settings.response_db(R, 3000.0) < -3.0);
+        // and taken away
+        settings.set_correction(&[0.0; BANDS], &[]);
+        assert_eq!(settings.correction(), Curve::default());
     }
 
     #[test]

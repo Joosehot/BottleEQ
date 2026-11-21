@@ -38,8 +38,15 @@ a, b = a[start:start + n], b[start + lag:start + lag + n]
 
 f, pa = welch(a, rate, nperseg=32768)
 _, pb = welch(b, rate, nperseg=32768)
-said = [line.split(",") for line in subprocess.run([EXE, "curve", *curve, "--csv"], capture_output=True, text=True).stdout.split() if "," in line]
-said = [(float(hz), float(db)) for hz, db in said]
+def numbers(line):
+    try:
+        hz, db = line.split(",")
+        return float(hz), float(db)
+    except ValueError:
+        return None  # a line of words (the mode's or the calibration's name)
+
+
+said = [n for n in map(numbers, subprocess.run([EXE, "curve", *curve, "--csv"], capture_output=True, text=True).stdout.splitlines()) if n]
 
 rows = []
 for hz, db in said:

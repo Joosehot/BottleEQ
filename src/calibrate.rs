@@ -320,10 +320,9 @@ impl Calibration {
         Ok(path)
     }
 
-    /// Set the equalizer to it.
+    /// Set it as the correction, under whatever curve is set by hand.
     pub fn set(&self, settings: &Settings) {
-        settings.set_all(&self.gains);
-        settings.set_points(&self.points);
+        settings.set_correction(&self.gains, &self.points);
     }
 }
 

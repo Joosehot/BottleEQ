@@ -225,25 +225,21 @@ pub const SHORT_TAKES: f64 = BEFORE + SECONDS + AFTER + 0.7;
 
 /// The short measurement the guesser works from: one sweep at one level, a quarter of a minute. What
 /// changes with the level is not found by it.
-pub fn short(microphone: &Input, play_to: &Output, level: f32, through: Option<&Curve>) -> Result<Measured, String> {
+pub fn short(microphone: &Input, play_to: &Output, level: f32, through: &[Curve]) -> Result<Measured, String> {
     let mut m = once(microphone, play_to, level)?;
-    if let Some(curve) = through {
-        m.eq = m.hz.iter().map(|hz| curve.response_db(play_to.rate as f64, *hz as f64)).collect();
-    }
+    m.eq = m.hz.iter().map(|hz| through.iter().map(|curve| curve.response_db(play_to.rate as f64, *hz as f64)).sum()).collect();
     Ok(m)
 }
 
 /// Measure: the sweep at `level` and once more `QUIETER` dB under it, about half a minute in all.
 /// `play_to` is the device the sound is on its way to the speakers from: the path's source when the
-/// path runs (the sweep then passes the equalizer as music does; `through` is its curve then), else
+/// path runs (the sweep then passes the equalizer as music does; `through` are its curves then), else
 /// the speakers themselves.
-pub fn measure(microphone: &Input, play_to: &Output, level: f32, through: Option<&Curve>) -> Result<Measured, String> {
+pub fn measure(microphone: &Input, play_to: &Output, level: f32, through: &[Curve]) -> Result<Measured, String> {
     let loud = once(microphone, play_to, level)?;
     let quiet = once(microphone, play_to, level * 10f32.powf(-QUIETER / 20.0))?;
     let mut m = borne_out(loud, &quiet);
-    if let Some(curve) = through {
-        m.eq = m.hz.iter().map(|hz| curve.response_db(play_to.rate as f64, *hz as f64)).collect();
-    }
+    m.eq = m.hz.iter().map(|hz| through.iter().map(|curve| curve.response_db(play_to.rate as f64, *hz as f64)).sum()).collect();
     Ok(m)
 }
 

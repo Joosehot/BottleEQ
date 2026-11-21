@@ -49,7 +49,11 @@
 //!   bottle-eq modes                                    the modes
 //!   bottle-eq curve --gains | --mode | --points ...    the curve they make, every third of an octave
 //!
+//! A calibration lies under the curve as a correction of its own: a mode, the bands and the points are
+//! put on top of it and leave it as it is, and so does "flat".
+//!
 //! While `run` plays, a line sets the curve: "mode rock", "modes", "points 100:cut 12k:+8:spike", "1k +3",
+//! "calibration speakers", "calibration none",
 //! "31.5 -2", "8 4" (the 8th band), "flat", "off", "on"; an empty line stops.
 //!
 //! The window begins at once when --exclusive or --shared is given with both devices; else it waits for
@@ -270,8 +274,12 @@ fn show_gains(gains: &Settings, rate: u32) {
     if !points.is_empty() {
         println!("points:     {}", points.join(" | "));
     }
+    let under = gains.correction();
+    if under != eq::Curve::default() {
+        println!("under it, the correction: bands {} and {} points{}", under.gains.iter().map(|g| format!("{g:+.1}")).collect::<Vec<_>>().join(" "), under.points().len(), if gains.correcting.load(Ordering::Relaxed) { "" } else { " (left out)" });
+    }
     match gains.on.load(Ordering::Relaxed) {
-        true => println!("            turned down {:.1} dB for headroom{}", -set.headroom(rate as f64), if gains.volume() != 0.0 { format!("; volume {:+.1} dB", gains.volume()) } else { String::new() }),
+        true => println!("            turned down {:.1} dB for headroom{}", -gains.headroom(rate as f64), if gains.volume() != 0.0 { format!("; volume {:+.1} dB", gains.volume()) } else { String::new() }),
         false => println!("            off: the sound passes untouched"),
     }
 }
@@ -379,6 +387,7 @@ fn main() {
                 measure: measure_flag,
                 correct,
                 guess: guess_flag,
+                calibration: calibration_text,
                 gentle,
                 kind: kind.clone(),
             };
@@ -427,12 +436,11 @@ fn main() {
             let m = guess::like(&curve, &guess::learn(&curves));
             let want = calibrate::wanted(&m, how);
             let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0, how);
-            gains.set_all(&fitted.gains);
-            gains.set_points(&fitted.points);
+            gains.set_correction(&fitted.gains, &fitted.points);
             println!("\"{}\", one of the {} curves of {kind}: not measured here; what its measurer found it to be off by (from its target, where the file says one)", curve.name, curves.len());
             println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);
             show_gains(&gains, 48000);
-            let set = gains.get();
+            let set = gains.correction();
             let after: Vec<f32> = (0..m.hz.len()).map(|i| m.db[i] + set.response_db(48000.0, m.hz[i] as f64)).collect();
             println!("      Hz   the curve   wanted   the correction   with it");
             for i in (0..m.hz.len()).step_by(8) {
@@ -459,7 +467,7 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(500));
                 running
             });
-            let through = || running.is_some().then(|| gains.get());
+            let through = || if running.is_some() { gains.passed().to_vec() } else { Vec::new() };
             let play_to = source.as_ref().unwrap_or(&target);
             let level = level_given.unwrap_or(0.5);
             let said = |m: &measure::Measured| {
@@ -469,7 +477,7 @@ fn main() {
             let m = if guessing {
                 // one sweep, and the rest of the curve from what curves of the kind look like
                 println!("a short measurement with \"{}\": one sweep from 20 Hz to 20 kHz, about {:.0} seconds ...", mic.name, measure::SHORT_TAKES);
-                let mut m = measure::short(&mic, play_to, level, through().as_ref()).unwrap_or_else(|e| fail(&e));
+                let mut m = measure::short(&mic, play_to, level, &through()).unwrap_or_else(|e| fail(&e));
                 println!("the sweep arrived {:.2} s into the recording, {:.1} dB of what was sent; {:.0}% of the frequencies clearly above the noise", m.arrived, m.level, 100.0 * m.share());
                 let curves = guess::training(&kind);
                 let (measured, guessed) = guess::fill(&mut m, &guess::learn(&curves));
@@ -481,7 +489,7 @@ fn main() {
                 m
             } else {
                 println!("measuring with \"{}\": a sweep from 20 Hz to 20 kHz, and once more 10 dB quieter; about {:.0} seconds ...", mic.name, measure::TAKES);
-                let m = measure::measure(&mic, play_to, level, through().as_ref()).unwrap_or_else(|e| fail(&e));
+                let m = measure::measure(&mic, play_to, level, &through()).unwrap_or_else(|e| fail(&e));
                 said(&m);
                 println!("      Hz      dB   above the noise   off in the quieter sweep");
                 for i in (0..m.hz.len()).step_by(8) {
@@ -502,8 +510,7 @@ fn main() {
                 // the measured curve turned over into the equalizer's
                 let want = calibrate::wanted(&m, how);
                 let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, target.rate as f64, how);
-                gains.set_all(&fitted.gains);
-                gains.set_points(&fitted.points);
+                gains.set_correction(&fitted.gains, &fitted.points);
                 println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);
                 show_gains(&gains, target.rate);
                 let before = calibrate::spread(&calibrate::raw(&m), &want.reach);
@@ -513,7 +520,7 @@ fn main() {
                     // and measured again through it, at the same frequencies
                     std::thread::sleep(Duration::from_secs(1));
                     println!("measuring again through the correction, in full (two sweeps, about {:.0} seconds) ...", measure::TAKES);
-                    let again = measure::measure(&mic, play_to, level, through().as_ref()).unwrap_or_else(|e| fail(&e));
+                    let again = measure::measure(&mic, play_to, level, &through()).unwrap_or_else(|e| fail(&e));
                     said(&again);
                     println!("      Hz   before    after   the correction");
                     for i in (0..m.hz.len()).step_by(8) {
@@ -533,7 +540,7 @@ fn main() {
                     println!("from flat before: {before:.2} dB. Not measured again: without --from the sweep does not pass the equalizer");
                 }
                 if let Some(name) = save_text {
-                    let set = gains.get();
+                    let set = gains.correction();
                     // what was guessed is not kept as measured: the guesser must not learn from its own guesses
                     let measured = (0..m.hz.len()).map(|i| m.certain[i] && !m.guessed.get(i).copied().unwrap_or(false)).collect();
                     let calibration = calibrate::Calibration { name, kind: kind.clone(), device: target.name.clone(), microphone: mic.name.clone(), day: calibrate::today(), gains: set.gains, points: set.points().to_vec(), hz: m.hz.clone(), raw: calibrate::raw(&m), certain: measured };
@@ -555,11 +562,10 @@ fn main() {
             }
             let want = calibrate::wanted(&m, how);
             let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0, how);
-            gains.set_all(&fitted.gains);
-            gains.set_points(&fitted.points);
+            gains.set_correction(&fitted.gains, &fitted.points);
             println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);
             show_gains(&gains, 48000);
-            let (alone, set) = (calibrate::raw(&m), gains.get());
+            let (alone, set) = (calibrate::raw(&m), gains.correction());
             let after: Vec<f32> = (0..n).map(|i| alone[i] + set.response_db(48000.0, m.hz[i] as f64)).collect();
             println!("      Hz   measured   wanted   the curve   with it");
             for i in (0..n).step_by(8) {
@@ -620,6 +626,14 @@ fn main() {
                         Err(e) => println!("{e}"),
                     },
                     ["volume", db] if db.parse::<f32>().is_ok() => g.set_volume(db.parse().unwrap_or(0.0)),
+                    ["calibration", "none"] => g.set_correction(&[0.0; BANDS], &[]),
+                    ["calibration", name @ ..] if !name.is_empty() => match calibrate::calibration(&name.join(" ")) {
+                        Ok(calibration) => {
+                            println!("calibration: {}", calibration.name);
+                            calibration.set(&g);
+                        }
+                        Err(e) => println!("{e}"),
+                    },
                     ["flat"] => g.flat(),
                     ["off"] => g.on.store(false, Ordering::Relaxed),
                     ["on"] => g.on.store(true, Ordering::Relaxed),
@@ -721,7 +735,6 @@ fn main() {
         }
         Some("curve") => {
             // the curve the gains make: every third of an octave, or every twelfth as "hz,dB" with --csv
-            let set = gains.get();
             let (rate, csv) = (48000.0, args.iter().any(|a| a == "--csv"));
             if !csv {
                 show_gains(&gains, rate as u32);
@@ -730,7 +743,7 @@ fn main() {
             for i in 0..=10 * step {
                 let hz = 20.0 * 2f64.powf(i as f64 / step as f64);
                 if hz < 0.45 * rate {
-                    let db = set.response_db(rate, hz);
+                    let db = gains.response_db(rate, hz);
                     match csv {
                         true => println!("{hz:.2},{db:.3}"),
                         false => println!("{hz:>8.0} Hz {db:>+6.2} dB  {}", "#".repeat(((db.max(-24.0) + 24.0) * 1.5).round() as usize)),
