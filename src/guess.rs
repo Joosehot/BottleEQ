@@ -363,7 +363,7 @@ pub fn like(curve: &Known, model: &Model) -> Measured {
     let hz = grid();
     let g = guess(model, &curve.db, &curve.known);
     let n = hz.len();
-    Measured { hz, db: g.db, certain: vec![true; n], off_level: Vec::new(), eq: vec![0.0; n], guessed: vec![true; n], over_noise: vec![0.0; n], peak: 0.0, arrived: 0.0, level: 0.0 }
+    Measured { hz, db: g.db, certain: vec![true; n], off_level: Vec::new(), second_off: 0.0, eq: vec![0.0; n], guessed: vec![true; n], over_noise: vec![0.0; n], peak: 0.0, arrived: 0.0, level: 0.0 }
 }
 
 /// The curve of the training set asked for by name: the name, its beginning, or a part of it.

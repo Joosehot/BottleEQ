@@ -385,6 +385,13 @@ it was tried on (2026-11-21), the 128 frames (2.7 ms) asked for until then broke
 measurement made through that came out wrong; whether 1024 mends it there has not yet been heard.
 Where the sound card keeps up, less can be asked for: `BOTTLE_EQ_BLOCK=128 bottle-eq window ...`.
 
+On that machine the sound did not break up after all, as its owner then heard; what he heard was the
+second sweep of a measurement, sent 10 dB quieter than the first, come out much *louder*. Something
+there sets the volume by itself (what, is not known), so nearly every frequency was marked as not to be
+believed. Since then each frequency of the quieter sweep is held against how that sweep arrived as a
+whole, not against the 10 dB it was sent at, and when the whole is more than 3 dB from those 10 dB the
+measurement says so. Not yet tried on that machine.
+
 Checked (2026-11-21) in a box without a sound card (`linux/Dockerfile`, `linux/test.sh`: Ubuntu 24.04,
 PipeWire 1.0.5 and WirePlumber, one output device that plays to nowhere):
 

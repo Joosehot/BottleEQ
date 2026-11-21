@@ -472,6 +472,9 @@ fn main() {
             let level = level_given.unwrap_or(0.5);
             let said = |m: &measure::Measured| {
                 println!("the sweep arrived {:.2} s into the recording, {:.1} dB of what was sent; the recording's loudest sample: {} dB{}", m.arrived, m.level, db(m.peak).trim(), if m.peak >= 0.99 { "  (IT CLIPPED: turn the microphone down)" } else { "" });
+                if let Some(levels) = m.levels_said() {
+                    println!("NOTE: {levels}");
+                }
                 println!("{:.0}% of the frequencies from 20 Hz to 20 kHz are to be believed: clearly ({} dB) above the noise, and {} dB quieter (within {}) in the quieter sweep", 100.0 * m.share(), measure::CLEAR, measure::QUIETER, measure::STEADY);
             };
             let m = if guessing {
@@ -556,7 +559,7 @@ fn main() {
             let rows: Vec<Vec<f32>> = text.lines().skip(1).map(|l| l.split(',').filter_map(|n| n.trim().parse().ok()).collect()).filter(|r: &Vec<f32>| r.len() >= 3).collect();
             let column = |c: usize| -> Vec<f32> { rows.iter().map(|r| r.get(c).copied().unwrap_or(0.0)).collect() };
             let n = rows.len();
-            let m = measure::Measured { hz: column(0), db: column(1), certain: column(2).iter().map(|c| *c != 0.0).collect(), over_noise: column(3), off_level: column(4), eq: column(5), guessed: Vec::new(), peak: 0.0, arrived: 0.0, level: 0.0 };
+            let m = measure::Measured { hz: column(0), db: column(1), certain: column(2).iter().map(|c| *c != 0.0).collect(), over_noise: column(3), off_level: column(4), second_off: 0.0, eq: column(5), guessed: Vec::new(), peak: 0.0, arrived: 0.0, level: 0.0 };
             if n == 0 {
                 fail(&format!("{path}: no measurement in it"));
             }

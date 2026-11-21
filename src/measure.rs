@@ -74,6 +74,10 @@ pub struct Measured {
     /// how much quieter than the 10 dB asked each frequency came out of the quieter sweep, in dB
     /// (0: just as it should); empty when only one level was measured
     pub off_level: Vec<f32>,
+    /// how far from the 10 dB quieter it was sent the quieter sweep arrived as a whole, in dB (0: as
+    /// sent; +14: it arrived 4 dB louder than the first). Something on the way then sets the volume by
+    /// itself; each frequency is judged against this, not against what was sent
+    pub second_off: f32,
     /// the equalizer's curve the sweep went through, in dB at each frequency (0 where it did not)
     pub eq: Vec<f32>,
     /// true where the level was not measured but guessed (`guess.rs`); empty when nothing was
@@ -93,6 +97,16 @@ impl Measured {
     /// The share of the frequencies that are to be believed.
     pub fn share(&self) -> f32 {
         self.certain.iter().filter(|c| **c).count() as f32 / self.certain.len().max(1) as f32
+    }
+
+    /// What is to be said when the quieter sweep did not arrive as much quieter as it was sent.
+    pub fn levels_said(&self) -> Option<String> {
+        (self.second_off.abs() > STEADY).then(|| {
+            format!(
+                "the second sweep was sent {QUIETER:.0} dB quieter than the first and arrived {:+.1} dB against it: something between Bottle EQ and the speakers sets the volume by itself (a leveller, a limiter, sound effects, the speakers' own); the curve holds only as far as that kept still within each sweep",
+                self.second_off - QUIETER
+            )
+        })
     }
 
     /// The level nearest a frequency, and whether it is certain.
@@ -194,7 +208,7 @@ pub fn analyse(recording: &[f32], rate: u32) -> Result<Measured, String> {
     let of = if middle.is_empty() { &all } else { &middle };
     let average = of.iter().sum::<f32>() / of.len() as f32;
     let eq = vec![0.0; hz.len()];
-    Ok(Measured { hz: hz.iter().map(|hz| *hz as f32).collect(), db: level.iter().map(|l| l - average).collect(), certain, off_level: Vec::new(), eq, guessed: Vec::new(), over_noise, peak, arrived: spike as f32 / rate as f32, level: average })
+    Ok(Measured { hz: hz.iter().map(|hz| *hz as f32).collect(), db: level.iter().map(|l| l - average).collect(), certain, off_level: Vec::new(), second_off: 0.0, eq, guessed: Vec::new(), over_noise, peak, arrived: spike as f32 / rate as f32, level: average })
 }
 
 /// One sweep: record the microphone, play the sweep to an output like any program would, and compare.
@@ -213,8 +227,14 @@ fn once(microphone: &Input, play_to: &Output, level: f32) -> Result<Measured, St
 /// dB quieter within `STEADY`.
 fn borne_out(mut loud: Measured, quiet: &Measured) -> Measured {
     loud.off_level = (0..loud.hz.len()).map(|i| (quiet.db[i] + quiet.level) - (loud.db[i] + loud.level) + QUIETER).collect();
+    // the sweep as a whole: the middle one of the frequencies heard clearly in both. On some machines
+    // the second sweep does not arrive as much quieter as it was sent (it was heard louder than the
+    // first on a Linux machine); a frequency is then held against the whole, not against what was sent
+    let mut both: Vec<f32> = (0..loud.hz.len()).filter(|i| loud.certain[*i] && quiet.certain[*i]).map(|i| loud.off_level[i]).collect();
+    both.sort_by(|a, b| a.total_cmp(b));
+    loud.second_off = both.get(both.len() / 2).copied().unwrap_or(0.0);
     for i in 0..loud.hz.len() {
-        loud.certain[i] &= quiet.certain[i] && loud.off_level[i].abs() <= STEADY;
+        loud.certain[i] &= quiet.certain[i] && (loud.off_level[i] - loud.second_off).abs() <= STEADY;
     }
     loud
 }
@@ -350,7 +370,22 @@ mod tests {
         // and the same sound twice is borne out everywhere it was believed
         let (a, b) = (analyse(&recorded(48000, 0.0005, |_| {}), 48000).unwrap(), analyse(&recorded(48000, 0.0005, |block| block.iter_mut().for_each(|s| *s *= quieter)), 48000).unwrap());
         let share = a.share();
-        assert!(borne_out(a, &b).share() > share - 0.05);
+        let m = borne_out(a, &b);
+        assert!(m.share() > share - 0.05);
+        assert!(m.second_off.abs() < 0.3 && m.levels_said().is_none());
+    }
+
+    #[test]
+    fn a_second_sweep_that_arrives_louder_is_said_and_its_shape_still_counts() {
+        // something on the way sets the volume by itself: the sweep sent 10 dB quieter arrives 4 dB
+        // louder than the first, with the same shape
+        let louder = 10f32.powf(4.0 / 20.0);
+        let (a, b) = (analyse(&recorded(48000, 0.0005, |_| {}), 48000).unwrap(), analyse(&recorded(48000, 0.0005, |block| block.iter_mut().for_each(|s| *s *= louder)), 48000).unwrap());
+        let share = a.share();
+        let m = borne_out(a, &b);
+        assert!((m.second_off - 14.0).abs() < 0.3, "the second sweep is {} dB off", m.second_off);
+        assert!(m.share() > share - 0.05, "{} of {} is still believed", m.share(), share);
+        assert!(m.levels_said().unwrap().contains("+4.0 dB"), "{:?}", m.levels_said());
     }
 
     #[test]

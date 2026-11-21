@@ -554,7 +554,8 @@ impl Window {
                     }
                     _ => String::new(),
                 };
-                self.measure_said = format!("measured: {:.0}% to be believed{flat}{clipped}", 100.0 * m.share());
+                let levels = m.levels_said().map_or(String::new(), |said| format!("\nNOTE: {said}"));
+                self.measure_said = format!("measured: {:.0}% to be believed{flat}{clipped}{levels}", 100.0 * m.share());
                 (self.measured, self.measuring) = (Some(m), None);
                 if self.correct_soon {
                     self.correct_soon = false;
