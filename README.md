@@ -1,6 +1,6 @@
 # Bottle EQ
 
-A system-wide audio equalizer for Windows with a live visualizer, in Rust. Built in five steps; all five
+A system-wide audio equalizer for Windows and Linux with a live visualizer, in Rust. Built in five steps; all five
 are made, and nobody has yet sat with it and listened.
 
 1. **Audio capture** (done): what Windows plays is captured by WASAPI loopback and played back out,
@@ -132,6 +132,47 @@ Measured:
 
 Not done: nobody has heard it.
 
+## On Linux
+
+The equalizer, the modes, the spectrum and the window are the same code on both systems; only the
+sound's way in and out differs (`src/audio.rs`: `audio/wasapi.rs` on Windows, `audio/pipewire.rs` on
+Linux, which needs PipeWire, as current distributions have).
+
+PipeWire is one graph in which every program that plays and every device is a node, all run in the same
+cycle. So nothing is listened to from the side as on Windows: Bottle EQ puts **a device of its own,
+"Bottle EQ"**, into the graph and plays what arrives there, equalized, on to the speakers within the
+same cycle. There is no spare device to go round by, no second clock, no cushion and no exclusive mode.
+
+```
+sudo apt install libpipewire-0.3-dev libclang-dev pkg-config     # to build (Ubuntu's names)
+cargo build --release
+bottle-eq devices                 # 1 is Bottle EQ's own device, the others are the speakers
+bottle-eq window --to <speakers>  # starts at once; then choose "Bottle EQ" as the output device in the sound settings
+bottle-eq run --to <speakers> --mode rock
+```
+
+Checked (2026-11-21) in a box without a sound card (`linux/Dockerfile`, `linux/test.sh`: Ubuntu 24.04,
+PipeWire 1.0.5 and WirePlumber, one output device that plays to nowhere):
+
+- `cargo test`: 17 tests (the 15 of Windows and two of the PipeWire part).
+- `selftest`: the 1 kHz tone comes through whole (100% of the sound is 1 kHz, no jump beyond the tone's
+  own, nothing dropped, never dry).
+- Flat: 20 s of pink noise leave **bit for bit** as they came (1,034,496 frames compared).
+- The equalizer in the running path, as on Windows (`tools/eqcheck.py`, same noise, same curves):
+
+  | curve | mean difference | biggest |
+  |---|---|---|
+  | `--gains 6,0,-4,0,3,-6,0,4,0,-3` | 0.01 dB | 0.05 dB at 101 Hz |
+  | `--mode "bass boost" --points "100:cut:1.5 1k:-2 12k:+8:spike"` | 0.03 dB | 0.37 dB at 11.5 kHz |
+
+- The window (under Xvfb, software OpenGL): it opens, shows the live spectrum of music played to
+  "Bottle EQ", and its own test drags a point (`docs/window-linux.png`).
+
+Not done on Linux: it has never run on a real machine with a sound card and a desktop, so nobody has
+heard it, the delay is not measured (the box's device says 0 ms; what is shown is what PipeWire says of
+the way to the device, as for any program), and programs that speak PulseAudio (browsers; through
+pipewire-pulse) have not been tried, only PipeWire's own.
+
 ## How the sound gets through (WASAPI loopback)
 
 Windows mixes every program's sound for one output device (an endpoint: the speakers, S/PDIF) into one
@@ -165,7 +206,7 @@ through the `windows` crate.
 ## Use
 
 ```
-bottle-eq                                          the window
+bottle-eq                                          the window (on Linux: bottle-eq window --to <speakers>)
 bottle-eq devices                                  the output devices, their formats and blocks
 bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other (Enter stops)
 bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured

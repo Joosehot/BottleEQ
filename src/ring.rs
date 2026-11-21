@@ -51,6 +51,7 @@ impl Ring {
     }
 
     /// Samples read so far, in all.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn read_total(&self) -> usize {
         self.read.load(Ordering::Relaxed)
     }

@@ -1,4 +1,4 @@
-//! Bottle EQ: a system-wide audio equalizer for Windows.
+//! Bottle EQ: a system-wide audio equalizer for Windows and Linux.
 //!
 //!   bottle-eq [window] [--from <device>] [--to <device>]   the window: the live spectrum, the curve and
 //!                                                      its points to drag, the modes, Flat, Start and Stop
@@ -9,7 +9,8 @@
 //!                                                      music through the whole path; what was captured and
 //!                                                      what the target was given are kept as WAV files
 //!
-//! A device is its number in `devices` or a part of its name. Options:
+//! A device is its number in `devices` or a part of its name. On Linux --from is left out: the sound
+//! is captured from Bottle EQ's own device, which programs play to (see `audio/pipewire.rs`). Options:
 //!   --exclusive | --shared   take the target for Bottle EQ alone (short delay) or share it (long delay);
 //!                            without either, `run` asks
 //!   --cushion-ms <n>         sound kept queued on top of what the devices' blocks need (default 2)
@@ -33,10 +34,10 @@
 //!
 //! Steps 1 to 5 of 5.
 
+mod audio;
 mod eq;
 mod ring;
 mod spectrum;
-mod wasapi;
 mod window;
 
 use std::io::Write;
@@ -44,7 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use eq::{Eq, Kind, Point, Settings, BANDS, CENTRES, CUT_Q, POINT_Q};
-use wasapi::{find, outputs, run, value, Output, Running};
+use audio::{find, outputs, run, value, Output, Running};
 
 fn fail(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -248,6 +249,11 @@ fn show_gains(gains: &Settings, rate: u32) {
 
 fn describe(running: &Running, source: &Output, target: &Output) {
     let o = &running.opened;
+    if cfg!(target_os = "linux") {
+        println!("programs play to:  \"Bottle EQ\", a device of its own in the PipeWire graph (choose it as the output device)");
+        println!("it is played on to: {}  (32-bit float, {} Hz; a block of {} frames, {:.2} ms, is asked for)", target.name, running.out_rate, o.out_block, o.out_block as f32 * 1000.0 / running.out_rate as f32);
+        return;
+    }
     println!("capturing what plays to: {}  (in blocks of {} frames, {:.2} ms)", source.name, o.in_block, o.in_block as f32 * 1000.0 / running.in_rate as f32);
     println!(
         "playing it to:           {}  ({}, blocks of {} frames, {:.2} ms, {})",
@@ -272,6 +278,8 @@ fn main() {
         (i < args.len()).then(|| args.remove(i))
     };
     let (from, to) = (take("--from"), take("--to"));
+    // Linux: the sound comes from Bottle EQ's own device, the first of the devices
+    let from = from.or(cfg!(target_os = "linux").then(|| "1".to_string()));
     let cushion_ms: f32 = take("--cushion-ms").map(|s| s.parse().unwrap_or_else(|_| fail("--cushion-ms takes a number"))).unwrap_or(2.0);
     let (file, record) = (take("--file"), take("--record"));
     let level: f32 = take("--level").map(|s| s.parse().unwrap_or_else(|_| fail("--level takes a number"))).unwrap_or(1.0);
@@ -329,22 +337,17 @@ fn main() {
         Some("devices") => {
             for (i, o) in outputs().unwrap_or_else(|e| fail(&e)).iter().enumerate() {
                 let ms = |frames: u32| frames as f32 * 1000.0 / o.rate as f32;
-                println!(
-                    "{}. {}{}  ({} channels, {} Hz; shared blocks {:.2} ms, least {:.2} ms)",
-                    i + 1,
-                    o.name,
-                    if o.default { "  [Windows plays here]" } else { "" },
-                    o.channels,
-                    o.rate,
-                    ms(o.periods.0),
-                    ms(o.periods.1)
-                );
+                let plays = if o.default { format!("  [{} plays here]", audio::SYSTEM) } else { String::new() };
+                match cfg!(windows) {
+                    true => println!("{}. {}{plays}  ({} channels, {} Hz; shared blocks {:.2} ms, least {:.2} ms)", i + 1, o.name, o.channels, o.rate, ms(o.periods.0), ms(o.periods.1)),
+                    false => println!("{}. {}{plays}", i + 1, o.name),
+                }
             }
         }
         Some("run") => {
             let (source, target) = pair();
             // the app asks for exclusive mode: from the one who runs it first, then from Windows
-            let take_it = exclusive || (!shared && {
+            let take_it = exclusive || (cfg!(windows) && !shared && {
                 print!(
                     "Bottle EQ wants \"{}\" for itself (exclusive mode): the delay is then about 6 ms instead of 44.\nNothing else can play to that device while Bottle EQ runs. Take it? [Y/n] ",
                     target.name
@@ -431,7 +434,7 @@ fn main() {
             }
             // the tone: 1 kHz at -40 dB, played to the source like any program would
             println!("a quiet 1 kHz tone (-40 dB, {length} s) is played to the source ...");
-            let tone = wasapi::tone(&source, HZ, 0.01, length);
+            let tone = audio::tone(&source, HZ, 0.01, length);
             let _ = running.delay();
             std::thread::sleep(Duration::from_secs_f64(length + 0.3));
             let (mean, longest) = running.delay();
@@ -543,7 +546,7 @@ fn main() {
             describe(&running, &source, &target);
             std::thread::sleep(Duration::from_millis(500));
             println!("playing {file} ({seconds:.0} s, at {level} of its level) to the source ...");
-            let playing = wasapi::play(&source, music);
+            let playing = audio::play(&source, music);
             std::thread::sleep(Duration::from_secs(3));
             let _ = running.delay();
             let _ = playing.join();

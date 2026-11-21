@@ -35,8 +35,9 @@
 //! The path: capture thread -> lock-free ring -> playback thread. Both threads run at the "Pro Audio"
 //! priority Windows keeps for this, wake on the device's own event, and never lock or allocate.
 
+use super::{bits, value, Meters, Opened, Output, Running};
 use crate::ring::Ring;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -49,50 +50,6 @@ use windows::Win32::System::Com::*;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, CreateEventW, WaitForSingleObject, AVRT_PRIORITY_CRITICAL};
 
-/// What the two audio threads tell the rest of the program.
-#[derive(Default)]
-pub struct Meters {
-    pub captured: AtomicU64,
-    pub played: AtomicU64,
-    /// frames let go because the ring was too full (playback behind)
-    pub dropped: AtomicU64,
-    /// times the ring ran dry while playing (a gap in the sound, or simply nothing playing any more)
-    pub dry: AtomicU64,
-    /// frames in the ring, as the playback thread last saw it
-    pub fill: AtomicU64,
-    /// how much faster (+) or slower (-) than nominal the ring is being read, in parts per million
-    pub drift_ppm: AtomicU32,
-    pub peak_in: AtomicU32,
-    pub peak_out: AtomicU32,
-    /// the mean and the longest time, in microseconds, between a frame arriving from the source's engine
-    /// and being handed to the target (since the last look)
-    pub wait_sum: AtomicU64,
-    pub wait_count: AtomicU64,
-    pub wait_longest: AtomicU64,
-    /// times the playback thread was woken more than a block late: the device had nothing to play
-    pub late: AtomicU64,
-    /// times Windows said a captured block does not follow the one before (sound was lost on the way in)
-    pub breaks: AtomicU64,
-    /// the loudest jump from one frame to the next in what was captured (first channel), and how many
-    /// frames had been captured when it came
-    pub jump_in: AtomicU32,
-    pub jump_at: AtomicU64,
-    /// audio threads that Windows gave its "Pro Audio" priority (2 when both have it)
-    pub priority: AtomicU64,
-    /// when (in 100 ns of the performance counter) the latest captured block arrived, and how many
-    /// frames had been captured before it
-    stamp_time: AtomicU64,
-    stamp_frames: AtomicU64,
-}
-
-fn bits(x: f32) -> u32 {
-    x.to_bits()
-}
-
-pub fn value(a: &AtomicU32) -> f32 {
-    f32::from_bits(a.load(Ordering::Relaxed))
-}
-
 /// The performance counter now, in 100 ns.
 fn now() -> u64 {
     let (mut count, mut per_second) = (0i64, 0i64);
@@ -101,17 +58,6 @@ fn now() -> u64 {
         let _ = QueryPerformanceFrequency(&mut per_second);
     }
     (count as u128 * 10_000_000 / per_second.max(1) as u128) as u64
-}
-
-#[derive(Clone)]
-pub struct Output {
-    pub id: String,
-    pub name: String,
-    pub channels: usize,
-    pub rate: u32,
-    pub default: bool,
-    /// engine periods in frames: (usual, least)
-    pub periods: (u32, u32),
 }
 
 unsafe fn enumerator() -> Win<IMMDeviceEnumerator> {
@@ -144,17 +90,6 @@ pub fn outputs() -> Result<Vec<Output>, String> {
         }
     };
     list().map_err(|e| format!("listing the output devices: {e}"))
-}
-
-/// An output by its number in the list or by a part of its name.
-pub fn find(wanted: &str) -> Result<Output, String> {
-    let all = outputs()?;
-    let by_number = wanted.parse::<usize>().ok().filter(|n| (1..=all.len()).contains(n)).map(|n| n - 1);
-    let by_name = || all.iter().position(|o| o.name.to_lowercase().contains(&wanted.to_lowercase()));
-    match by_number.or_else(by_name) {
-        Some(i) => Ok(all[i].clone()),
-        None => Err(format!("no output device matches \"{wanted}\" (there are: {})", all.iter().map(|o| o.name.as_str()).collect::<Vec<_>>().join("; "))),
-    }
 }
 
 /// Reading between the samples: a windowed sinc, as in Vuuvee's resampler (16 zero crossings a side,
@@ -299,59 +234,6 @@ impl Reader {
             frames += 1;
         }
         m.played.fetch_add(frames, Ordering::Relaxed);
-    }
-}
-
-/// How the path was opened.
-#[derive(Clone, Default)]
-pub struct Opened {
-    /// frames per block arriving from the source
-    pub in_block: u32,
-    /// frames per block going to the target
-    pub out_block: u32,
-    pub exclusive: bool,
-    /// bits per sample the target takes (32 float in shared mode)
-    pub out_bits: u16,
-    /// why exclusive mode was not used, when it was asked for
-    pub note: String,
-    /// each captured block is played as it arrives, from the capture thread itself (no ring between two
-    /// threads)
-    pub direct: bool,
-}
-
-/// The running path: it lives as long as this is kept.
-pub struct Running {
-    stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
-    pub meters: Arc<Meters>,
-    pub opened: Opened,
-    pub in_rate: u32,
-    pub out_rate: u32,
-}
-
-impl Running {
-    /// The delay Bottle EQ adds, in milliseconds, (mean, longest), since the last look: from a frame
-    /// arriving from the source's engine to its beginning to play at the target.
-    ///
-    /// Through the ring: the wait until the frame is handed over, plus one block of the target's (a
-    /// buffer handed over at an event begins to play when the one before it ends).
-    /// Direct: the sound queued ahead of the frame in the target's buffer, plus the wait for the device's
-    /// next period to begin, which is anything from nothing to one block: half a block in the mean.
-    pub fn delay(&self) -> (f32, f32) {
-        let m = &self.meters;
-        let (sum, n, longest) = (m.wait_sum.swap(0, Ordering::Relaxed), m.wait_count.swap(0, Ordering::Relaxed), m.wait_longest.swap(0, Ordering::Relaxed));
-        let (mean, longest) = (sum as f32 / n.max(1) as f32 / 1000.0, longest as f32 / 1000.0);
-        let block = self.opened.out_block as f32 * 1000.0 / self.out_rate as f32;
-        if self.opened.direct { (mean + block / 2.0, longest + block) } else { (mean + block, longest + block) }
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
     }
 }
 

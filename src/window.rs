@@ -22,7 +22,7 @@ use eframe::egui::{self, pos2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 use crate::eq::{self, Curve, Eq, Kind, Mode, Point, Settings, BANDS, CENTRES, CUT_Q, MOST, POINTS, POINT_Q};
 use crate::ring::Ring;
 use crate::spectrum::{Spectrum, SIZE};
-use crate::wasapi::{self, run, Output, Running};
+use crate::audio::{self, run, Output, Running};
 
 /// the graph's edges: frequencies, the curve's dB each way, the spectrum's lowest level
 const LOW: f32 = 20.0;
@@ -190,7 +190,7 @@ impl Window {
                     match crate::read_wav(&file) {
                         Ok((rate, mut music)) if rate == source.rate => {
                             music.iter_mut().for_each(|s| *s *= level);
-                            wasapi::play(&source, music);
+                            audio::play(&source, music);
                         }
                         Ok((rate, _)) => self.said = format!("{file} is at {rate} Hz and the source at {} Hz", source.rate),
                         Err(e) => self.said = format!("{file}: {e}"),
@@ -210,12 +210,15 @@ impl Window {
         let (Some(s), Some(_)) = (self.source, self.target) else {
             return Some("Choose where the sound is captured from (From) and the speakers it is played to (to).".to_string());
         };
+        // Linux: Bottle EQ's own device is there only while it runs, so first Start, then choose it
+        if cfg!(target_os = "linux") && self.running.is_none() {
+            return Some("Press Start.".to_string());
+        }
         if !self.outputs[s].default {
             let plays = self.outputs.iter().find(|o| o.default).map_or("another device".to_string(), |o| format!("\"{}\"", o.name));
-            return Some(format!(
-                "Windows plays to {plays}, not to \"{}\".\nOnly what plays to \"{}\" passes through Bottle EQ:\nchoose it as the Windows output device (the speaker icon on the taskbar).",
-                self.outputs[s].name, self.outputs[s].name
-            ));
+            let (name, system) = (if cfg!(windows) { self.outputs[s].name.as_str() } else { "Bottle EQ" }, audio::SYSTEM);
+            let where_ = if cfg!(windows) { "the speaker icon on the taskbar" } else { "the sound settings" };
+            return Some(format!("{system} plays to {plays}, not to \"{name}\".\nOnly what plays to \"{name}\" passes through Bottle EQ:\nchoose it as the output device ({where_})."));
         }
         self.running.is_none().then(|| "Press Start.".to_string())
     }
@@ -243,8 +246,9 @@ impl Window {
             ui.add_enabled_ui(self.running.is_none(), |ui| {
                 ui.label("From");
                 egui::ComboBox::from_id_salt("from").width(170.0).selected_text(name(&self.outputs, self.source)).show_ui(ui, |ui| {
-                    for (i, o) in self.outputs.iter().enumerate() {
-                        ui.selectable_value(&mut self.source, Some(i), format!("{}{}", o.name, if o.default { "  (Windows plays here)" } else { "" }));
+                    // Linux: the sound comes from Bottle EQ's own device, the first; no other can be captured
+                    for (i, o) in self.outputs.iter().enumerate().filter(|(i, _)| cfg!(windows) || *i == 0) {
+                        ui.selectable_value(&mut self.source, Some(i), format!("{}{}", o.name, if o.default { format!("  ({} plays here)", audio::SYSTEM) } else { String::new() }));
                     }
                 });
                 ui.label("to");
@@ -257,7 +261,10 @@ impl Window {
                 if self.target == self.source {
                     self.target = None;
                 }
-                ui.checkbox(&mut self.exclusive, "exclusive").on_hover_text("Take the target for Bottle EQ alone: the delay is then about 6 ms instead of 44, and nothing else can play to that device meanwhile.");
+                // Linux has no such mode: the graph is shared by all and the delay is short as it is
+                if cfg!(windows) {
+                    ui.checkbox(&mut self.exclusive, "exclusive").on_hover_text("Take the target for Bottle EQ alone: the delay is then about 6 ms instead of 44, and nothing else can play to that device meanwhile.");
+                }
             });
             if was != (self.source, self.target, self.exclusive) {
                 self.said.clear();
@@ -549,7 +556,7 @@ impl eframe::App for Window {
             // every two seconds: which device Windows plays to now (asked in a thread of its own, as in `open`)
             self.looks += 1;
             if self.looks % 4 == 0 {
-                if let Ok(Ok(now)) = std::thread::spawn(wasapi::outputs).join() {
+                if let Ok(Ok(now)) = std::thread::spawn(audio::outputs).join() {
                     self.outputs.iter_mut().for_each(|o| o.default = now.iter().any(|n| n.id == o.id && n.default));
                 }
             }
@@ -589,25 +596,26 @@ impl eframe::App for Window {
 pub fn open(start: Start) -> Result<(), String> {
     // the devices are asked for in a thread of their own: this one is the window's, and the window
     // system wants it set up for COM in its own way
-    let outputs = std::thread::spawn(wasapi::outputs).join().map_err(|_| "the devices could not be listed".to_string())??;
+    let outputs = std::thread::spawn(audio::outputs).join().map_err(|_| "the devices could not be listed".to_string())??;
     let find = |wanted: &Option<String>| -> Result<Option<usize>, String> {
         let Some(wanted) = wanted.clone() else { return Ok(None) };
-        let found = std::thread::spawn(move || wasapi::find(&wanted)).join().map_err(|_| "the device could not be looked for".to_string())??;
+        let found = std::thread::spawn(move || audio::find(&wanted)).join().map_err(|_| "the device could not be looked for".to_string())??;
         Ok(outputs.iter().position(|o| o.id == found.id))
     };
-    // not said: captured from where Windows plays, and played to the other device if there is one other
-    let source = find(&start.from)?.or(outputs.iter().position(|o| o.default));
+    // not said: captured from where Windows plays; on Linux always from Bottle EQ's own device, the first
+    let source = if cfg!(windows) { find(&start.from)?.or(outputs.iter().position(|o| o.default)) } else { Some(0) };
     let target = find(&start.to)?.filter(|t| Some(*t) != source);
     if start.settings.get().points().is_empty() {
         start.settings.set_points(&first_points());
     }
     let mode = start.mode.and_then(|name| eq::mode(&name).ok()).map_or(String::new(), |m| m.name);
-    let begin = start.exclusive.is_some() && source.is_some() && target.is_some();
+    // Linux: nothing is taken from anyone by starting, so it starts as soon as it knows where to play
+    let begin = (start.exclusive.is_some() || cfg!(target_os = "linux")) && source.is_some() && target.is_some();
     let mut window = Window {
         outputs,
         source,
         target,
-        exclusive: start.exclusive.unwrap_or(true),
+        exclusive: start.exclusive.unwrap_or(cfg!(windows)),
         cushion_ms: start.cushion_ms,
         settings: start.settings,
         running: None,
