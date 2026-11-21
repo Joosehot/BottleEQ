@@ -237,8 +237,12 @@ holds 24 since this; it held 8). It is flattest at the place that was measured; 
 speakers, takes more headroom (turn the volume up), and a step to the side the narrow things it set
 right are elsewhere. On the measurement kept from the room (nothing played): the exact mirror's curve
 lies 0.45 dB from what is wanted and would bring 4.11 dB from flat to 0.62 dB, the careful way 3.97 dB
-to 1.90 dB, *if the speakers do as the curve says*; that the careful way does was measured (1.76 dB),
-the exact mirror has not been measured in the room yet. Making it takes about three seconds.
+to 1.90 dB, *if the speakers do as the curve says*. Making it takes about three seconds.
+
+Measured in the room (2026-11-21; measured, corrected with the exact mirror, measured again through
+it): within reach 160 frequencies from 82 Hz to 8.1 kHz; the curve lies 0.46 dB from what is wanted
+(2.57 dB at the most); **from flat: 3.88 dB before, 0.95 dB after** (the careful way: 3.90 to 1.76).
+It took 7.3 dB of headroom. Kept as the calibration "Speakers exact". Not yet listened to.
 
 **Save** keeps the curve under a name ("Speakers", "Headphones") with the devices, the day and the
 measurement it was made from: a file in the folder `calibrations` where Bottle EQ is run from. The list
