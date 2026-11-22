@@ -13,18 +13,6 @@
 //!                                                      careful way), measured again through it, and kept
 //!                                                      as a calibration of that name
 //!   bottle-eq calibrations                             the calibrations kept
-//!   bottle-eq guess --mic <microphone> --to <device> [--from <device>] [--type speakers|headphones] [--save <name>]
-//!                                                      one short sweep, the rest of the curve guessed from
-//!                                                      what curves of that kind look like, the correction
-//!                                                      for it, and (with --from) a whole measurement
-//!                                                      through it to see how near flat it came
-//!   bottle-eq guess --type headphones --like <name> [--save <name>]
-//!                                                      the correction for a curve of the training set by
-//!                                                      name: nothing is played or measured
-//!   bottle-eq import <file or folder> --type <kind>    bring curves in to learn from (AutoEq's results,
-//!                                                      or any table of frequency and dB)
-//!   bottle-eq training [--test]                        what there is to learn from; --test: how well each
-//!                                                      kind is guessed on curves it did not learn from
 //!   bottle-eq run --from <device> --to <device>        capture what plays to one, play it to the other
 //!   bottle-eq selftest --from <device> --to <device>   a quiet 1 kHz tone through the whole path, measured
 //!   bottle-eq playtest --from <device> --to <device> --file <wav> [--record <folder>] [--level <0..1>]
@@ -73,7 +61,6 @@
 mod audio;
 mod calibrate;
 mod eq;
-mod guess;
 mod measure;
 mod ring;
 mod spectrum;
@@ -352,7 +339,7 @@ fn main() {
     let level = level_given.unwrap_or(1.0);
     let (mic_text, keep_text) = (take("--mic"), take("--keep"));
     let (calibration_text, save_text) = (take("--calibration"), take("--save"));
-    let (kind, like_text) = (take("--type").unwrap_or("speakers".to_string()), take("--like"));
+    let kind = take("--type").unwrap_or("speakers".to_string());
     let volume: f32 = take("--volume").map(|s| s.parse().unwrap_or_else(|_| fail("--volume takes a number of dB, like +6"))).unwrap_or(0.0);
     let tone = |given: Option<String>, flag: &str| given.map(|s| s.parse::<f32>().unwrap_or_else(|_| fail(&format!("{flag} takes a number of dB, like +6"))));
     let (bass, sharpness, loudness) = (tone(take("--bass"), "--bass"), tone(take("--sharpness"), "--sharpness"), tone(take("--loudness"), "--loudness"));
@@ -369,7 +356,7 @@ fn main() {
         None => false,
     };
     let (exclusive, shared, measure_flag, correct) = (flag("--exclusive"), flag("--shared"), flag("--measure"), flag("--correct"));
-    let (test_flag, guess_flag, unprotected) = (flag("--test"), flag("--guess"), flag("--unprotected"));
+    let unprotected = flag("--unprotected");
     // a measured curve is turned over exactly, unless the careful way is asked for
     let gentle = flag("--gentle");
     let how = if gentle { &calibrate::GENTLE } else { &calibrate::EXACT };
@@ -427,7 +414,6 @@ fn main() {
                 mic: mic_text,
                 measure: measure_flag,
                 correct,
-                guess: guess_flag,
                 calibration: calibration_text,
                 gentle,
                 kind: kind.clone(),
@@ -448,53 +434,7 @@ fn main() {
                 println!("{}. {}{}", i + 1, m.name, if m.default { format!("  [{} records here]", audio::SYSTEM) } else { String::new() });
             }
         }
-        Some("import") => {
-            let path = args.get(1).cloned().unwrap_or_else(|| fail("import needs a file or a folder of curves, and --type <kind>"));
-            let (taken, left) = guess::import(&path, &kind).unwrap_or_else(|e| fail(&e));
-            println!("{taken} curves brought in to learn {kind} from (training/{kind}/); {left} files held no curve");
-        }
-        Some("training") => {
-            for kind in guess::KINDS {
-                let curves = guess::training(kind);
-                let own = curves.iter().filter(|c| c.name.starts_with("calibration ")).count();
-                let model = guess::learn(&curves);
-                println!("{kind}: {} curves to learn from ({} brought in, {own} from calibrations kept); they differ from their average in {} ways that count (hold {})", curves.len(), curves.len() - own, model.ways.len(), model.hold);
-                if test_flag && curves.len() >= 10 {
-                    println!("  every fifth curve held out and guessed from the other four fifths; the usual error over the frequencies not shown:");
-                    for (from, to) in [(300.0, 3000.0), (100.0, 8000.0), (500.0, 20000.0), (20.0, 2000.0)] {
-                        let (learned, held, guessed, average, level) = guess::tried(&curves, from, to);
-                        println!("  shown {from:>5.0} Hz to {to:>5.0} Hz ({learned} learned from, {held} tried): guessed {guessed:.2} dB, the kind's average alone {average:.2} dB, a level line {level:.2} dB");
-                    }
-                } else if test_flag {
-                    println!("  too few to hold any out");
-                }
-            }
-        }
-        Some("guess") if like_text.is_some() => {
-            // the correction for a curve of the training set: nothing is played, nothing measured
-            let curves = guess::training(&kind);
-            let curve = guess::named(&curves, like_text.as_deref().unwrap_or_default()).unwrap_or_else(|e| fail(&e));
-            let m = guess::like(&curve, &guess::learn(&curves));
-            let want = calibrate::wanted(&m, how);
-            let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, 48000.0, how);
-            gains.set_correction(&fitted.gains, &fitted.points);
-            println!("\"{}\", one of the {} curves of {kind}: not measured here; what its measurer found it to be off by (from its target, where the file says one)", curve.name, curves.len());
-            println!("the correction (the curve lies {:.2} dB from what is wanted, {:.2} dB at the most):", fitted.off, fitted.most_off);
-            show_gains(&gains, 48000);
-            let set = gains.correction();
-            let after: Vec<f32> = (0..m.hz.len()).map(|i| m.db[i] + set.response_db(48000.0, m.hz[i] as f64)).collect();
-            println!("      Hz   the curve   wanted   the correction   with it");
-            for i in (0..m.hz.len()).step_by(8) {
-                println!("  {:>6.0}   {:>+6.1}   {:>+6.1}   {:>+6.1}   {:>+6.1}  {}", m.hz[i], m.db[i], want.db[i], set.response_db(48000.0, m.hz[i] as f64), after[i], if want.reach[i] { "" } else { "-" });
-            }
-            println!("\"-\" marks what is out of reach. Off within reach: {:.2} dB as its measurer found it, {:.2} dB with the correction, if this device is as that one was (not measured)", calibrate::spread(&m.db, &want.reach), calibrate::spread(&after, &want.reach));
-            if let Some(name) = save_text {
-                let calibration = calibrate::Calibration { name, kind: kind.clone(), device: curve.name.clone(), microphone: "none: guessed from the training set".to_string(), day: calibrate::today(), gains: set.gains, points: set.points().to_vec(), hz: m.hz.clone(), raw: m.db.clone(), certain: vec![false; m.hz.len()] };
-                println!("kept: {} (use it with --calibration \"{}\")", calibration.save().unwrap_or_else(|e| fail(&e)), calibration.name);
-            }
-        }
-        Some(command @ ("measure" | "guess")) => {
-            let guessing = command == "guess";
+        Some("measure") => {
             let mic = audio::find_input(&mic_text.unwrap_or_else(|| fail("give --mic <microphone> (see `bottle-eq devices`)"))).unwrap_or_else(|e| fail(&e));
             if let Some(warning) = measure::camera_said(&mic.name) {
                 println!("WARNING: {warning}");
@@ -521,39 +461,23 @@ fn main() {
                 }
                 println!("{:.0}% of the frequencies from 20 Hz to 20 kHz are to be believed: clearly ({} dB) above the noise, and {} dB quieter (within {}) in the quieter sweep", 100.0 * m.share(), measure::CLEAR, measure::QUIETER, measure::STEADY);
             };
-            let m = if guessing {
-                // one sweep, and the rest of the curve from what curves of the kind look like
-                println!("a short measurement with \"{}\": one sweep from 20 Hz to 20 kHz, about {:.0} seconds ...", mic.name, measure::SHORT_TAKES);
-                let mut m = measure::short(&mic, play_to, level, &through()).unwrap_or_else(|e| fail(&e));
-                println!("the sweep arrived {:.2} s into the recording, {:.1} dB of what was sent; {:.0}% of the frequencies clearly above the noise", m.arrived, m.level, 100.0 * m.share());
-                let curves = guess::training(&kind);
-                let (measured, guessed) = guess::fill(&mut m, &guess::learn(&curves));
-                println!("{measured} frequencies measured, {guessed} guessed from {} curves of {kind}", curves.len());
-                println!("      Hz      dB");
-                for i in (0..m.hz.len()).step_by(8) {
-                    println!("  {:>6.0}  {:>+6.1}  {}", m.hz[i], m.db[i], if m.guessed[i] { "guessed" } else { "" });
-                }
-                m
-            } else {
-                println!("measuring with \"{}\": a sweep from 20 Hz to 20 kHz, and once more 10 dB quieter; about {:.0} seconds ...", mic.name, measure::TAKES);
-                let m = measure::measure(&mic, play_to, level, &through()).unwrap_or_else(|e| fail(&e));
-                said(&m);
-                println!("      Hz      dB   above the noise   off in the quieter sweep");
-                for i in (0..m.hz.len()).step_by(8) {
-                    println!("  {:>6.0}  {:>+6.1}   {:>5.0} dB   {:>+6.1} dB  {}", m.hz[i], m.db[i], m.over_noise[i], m.off_level[i], if m.certain[i] { "" } else { "?" });
-                }
-                println!("\"?\" marks what is not to be believed");
-                m
-            };
-            let rows = |m: &measure::Measured| -> Vec<String> { (0..m.hz.len()).map(|i| format!("{:.2},{:.3},{},{:.1},{:.2},{:.3},{}", m.hz[i], m.db[i], m.certain[i] as u8, m.over_noise[i], m.off_level.get(i).copied().unwrap_or(0.0), m.eq[i], m.guessed.get(i).copied().unwrap_or(false) as u8)).collect() };
+            println!("measuring with \"{}\": a sweep from 20 Hz to 20 kHz, and once more 10 dB quieter; about {:.0} seconds ...", mic.name, measure::TAKES);
+            let m = measure::measure(&mic, play_to, level, &through()).unwrap_or_else(|e| fail(&e));
+            said(&m);
+            println!("      Hz      dB   above the noise   off in the quieter sweep");
+            for i in (0..m.hz.len()).step_by(8) {
+                println!("  {:>6.0}  {:>+6.1}   {:>5.0} dB   {:>+6.1} dB  {}", m.hz[i], m.db[i], m.over_noise[i], m.off_level[i], if m.certain[i] { "" } else { "?" });
+            }
+            println!("\"?\" marks what is not to be believed");
+            let rows = |m: &measure::Measured| -> Vec<String> { (0..m.hz.len()).map(|i| format!("{:.2},{:.3},{},{:.1},{:.2},{:.3}", m.hz[i], m.db[i], m.certain[i] as u8, m.over_noise[i], m.off_level.get(i).copied().unwrap_or(0.0), m.eq[i])).collect() };
             let keep = |path: &str, m: &measure::Measured| {
-                std::fs::write(path, format!("hz,db,certain,above_noise_db,off_in_quieter_db,eq_db,guessed\n{}\n", rows(m).join("\n"))).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+                std::fs::write(path, format!("hz,db,certain,above_noise_db,off_in_quieter_db,eq_db\n{}\n", rows(m).join("\n"))).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
                 println!("kept: {path}");
             };
             if let Some(path) = &keep_text {
                 keep(path, &m);
             }
-            if correct || guessing {
+            if correct {
                 // the measured curve turned over into the equalizer's
                 let want = calibrate::wanted(&m, how);
                 let fitted = calibrate::fit(&m.hz, &want.db, &want.counts, target.rate as f64, how);
@@ -588,9 +512,7 @@ fn main() {
                 }
                 if let Some(name) = save_text {
                     let set = gains.correction();
-                    // what was guessed is not kept as measured: the guesser must not learn from its own guesses
-                    let measured = (0..m.hz.len()).map(|i| m.certain[i] && !m.guessed.get(i).copied().unwrap_or(false)).collect();
-                    let calibration = calibrate::Calibration { name, kind: kind.clone(), device: target.name.clone(), microphone: mic.name.clone(), day: calibrate::today(), gains: set.gains, points: set.points().to_vec(), hz: m.hz.clone(), raw: calibrate::raw(&m), certain: measured };
+                    let calibration = calibrate::Calibration { name, kind: kind.clone(), device: target.name.clone(), microphone: mic.name.clone(), day: calibrate::today(), gains: set.gains, points: set.points().to_vec(), hz: m.hz.clone(), raw: calibrate::raw(&m), certain: m.certain.clone() };
                     println!("kept: {} (use it with --calibration \"{}\")", calibration.save().unwrap_or_else(|e| fail(&e)), calibration.name);
                 }
             }
@@ -603,7 +525,7 @@ fn main() {
             let rows: Vec<Vec<f32>> = text.lines().skip(1).map(|l| l.split(',').filter_map(|n| n.trim().parse().ok()).collect()).filter(|r: &Vec<f32>| r.len() >= 3).collect();
             let column = |c: usize| -> Vec<f32> { rows.iter().map(|r| r.get(c).copied().unwrap_or(0.0)).collect() };
             let n = rows.len();
-            let m = measure::Measured { hz: column(0), db: column(1), certain: column(2).iter().map(|c| *c != 0.0).collect(), over_noise: column(3), off_level: column(4), second_off: 0.0, eq: column(5), guessed: Vec::new(), peak: 0.0, arrived: 0.0, level: 0.0 };
+            let m = measure::Measured { hz: column(0), db: column(1), certain: column(2).iter().map(|c| *c != 0.0).collect(), over_noise: column(3), off_level: column(4), second_off: 0.0, eq: column(5), peak: 0.0, arrived: 0.0, level: 0.0 };
             if n == 0 {
                 fail(&format!("{path}: no measurement in it"));
             }
@@ -873,6 +795,6 @@ fn main() {
                 println!("kept: {dir}/captured.wav (what came from the source), {dir}/handed.wav (what the target was given)");
             }
         }
-        _ => fail("commands: window | devices | measure --mic <microphone> --to <device> [--correct --save <name>] | guess | import <folder> --type <kind> | training | calibrations | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
+        _ => fail("commands: window | devices | measure --mic <microphone> --to <device> [--correct --save <name>] | calibrations | run --from <device> --to <device> | curve --gains <ten numbers> | selftest --from <device> --to <device> | playtest --from <device> --to <device> --file <wav>"),
     }
 }

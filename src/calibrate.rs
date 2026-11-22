@@ -214,11 +214,14 @@ pub fn fit(hz: &[f32], want: &[f32], counts: &[f32], rate: f64, how: &How) -> Fi
     Fitted { gains, points, off: mean(full.iter().copied()), most_off: full.iter().copied().fold(0.0, f32::max) }
 }
 
+/// The kinds of device a calibration is kept as.
+pub const DEVICE_KINDS: [&str; 2] = ["speakers", "headphones"];
+
 /// A calibration: a correction curve by name, with what it was made for and from.
 #[derive(Clone)]
 pub struct Calibration {
     pub name: String,
-    /// the kind of device: "speakers" or "headphones" (what the guesser learns it as)
+    /// the kind of device: "speakers" or "headphones"
     pub kind: String,
     /// the speakers (or headphones) and the microphone it was measured with, and the day
     pub device: String,
@@ -355,7 +358,7 @@ mod tests {
         let db: Vec<f32> = hz.iter().map(|hz| speakers.response_db(48000.0, *hz as f64)).collect();
         let certain: Vec<bool> = hz.iter().map(|hz| *hz >= from).collect();
         let n = hz.len();
-        Measured { hz, db, certain, off_level: Vec::new(), second_off: 0.0, eq: vec![0.0; n], guessed: Vec::new(), over_noise: vec![40.0; n], peak: 0.5, arrived: 1.2, level: -20.0 }
+        Measured { hz, db, certain, off_level: Vec::new(), second_off: 0.0, eq: vec![0.0; n], over_noise: vec![40.0; n], peak: 0.5, arrived: 1.2, level: -20.0 }
     }
 
     /// Speakers with a hump in the bass, a dip in the middle and a falling treble.
