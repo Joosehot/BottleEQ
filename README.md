@@ -14,6 +14,11 @@ Free, open-source speaker calibration and EQ for Windows and Linux. Make your sp
 
 Not a replacement for pro studio calibration gear.
 
+## Download
+
+**[Bottle EQ for Windows (64-bit)](https://github.com/Joosehot/BottleEQ/releases/latest/download/bottle-eq-windows-x64.zip)**:
+unpack it and start `bottle-eq.exe`. On Linux, build it as below.
+
 ## Build
 
 ```
