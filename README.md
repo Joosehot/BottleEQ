@@ -2,6 +2,14 @@
 
 Free, open-source speaker calibration and EQ for Windows and Linux. Make your speakers sound better for zero money.
 
+## Before and after
+
+Ten seconds of Bach (Toccata in D minor) played through Bottle EQ on cheap USB speakers and recorded
+in the room with a USB microphone:
+
+- ▶ **[Before: EQ off](https://github.com/Joosehot/BottleEQ/raw/master/docs/before.mp3)**
+- ▶ **[After: EQ on, the speakers corrected](https://github.com/Joosehot/BottleEQ/raw/master/docs/after.mp3)**
+
 ## Features
 - **Calibrate:** measure your speakers with a mic, Bottle EQ corrects them toward flat.
 - **EQ:** shape the sound yourself, like a bass boost.
