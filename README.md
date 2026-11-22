@@ -48,7 +48,8 @@ cargo build --release        # Rust; on Linux first: sudo apt install libpipewir
 target/release/bottle-eq     # the window (on Linux: bottle-eq window --to <speakers>)
 ```
 
-MIT licence (`LICENSE`).
+Copyright (C) 2026 Joosehot. Licensed under the GNU General Public License v3.0 (`LICENSE`).
+Versions up to 0.3.0 were released under the MIT licence.
 
 ## The window
 

@@ -3,7 +3,7 @@ name = "bottle-eq"
 version = "0.1.0"
 edition = "2021"
 description = "Bottle EQ: a system-wide audio equalizer for Windows and Linux with a live visualizer"
-license = "MIT"
+license = "GPL-3.0-only"
 publish = false
 
 [dependencies]
