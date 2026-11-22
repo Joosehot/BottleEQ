@@ -7,11 +7,6 @@ Free, open-source speaker calibration and EQ for Windows and Linux. Make your sp
 - **EQ:** shape the sound yourself, like a bass boost.
 - **Compare:** toggle on/off to hear the difference.
 
-## Best setting for bass boosted music
-- **Bass:** +5.0 dB
-- **Sharpness:** +5.0 dB
-- **Volume:** cranked up
-
 ## Recently added
 - **Loudness slider:** gives the volume back after a big boost (0 to +12 dB); a limiter keeps it from clipping.
 - **Speaker protection toggle:** on, boosts turn the sound down first so nothing is ever held back; off, it stays loud and the limiter does the work.
@@ -21,6 +16,16 @@ Free, open-source speaker calibration and EQ for Windows and Linux. Make your sp
 - **EQ ON / BYPASSED:** one button to hear the difference.
 - **Camera mic warning:** you are told if the calibration mic is a webcam's.
 - **Windows download:** no build needed, and no terminal window beside the app.
+
+## Recommended settings
+Two tested starting points, both on top of a finished calibration in Flat mode:
+
+- **Bass-boosted music:** Bass +5 dB, Sharpness +5 dB, volume up high.
+- **Film scores and classical:** Bass −6 dB, Sharpness +5 dB, Loudness +5 dB, volume up high. Tested on
+  Hans Zimmer's *Gladiator* and *The Lion King*, and Dvořák's Symphony No. 9 "From the New World".
+
+Tested on small speakers without a subwoofer. With a sub or bigger speakers you can push the Bass further.
+Calibrate first: these settings stack on top of the calibration.
 
 ## Mic tips
 - Use a decent mic (a cheap USB mic is fine).
