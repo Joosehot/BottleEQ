@@ -32,9 +32,16 @@
 //! a point is put on speakers that are already set right, and changing or flattening the curve on top
 //! leaves the correction as it is.
 //!
-//! **Bass and Sharpness** are a third curve, run after those two: a low shelf at 100 Hz and a high
-//! shelf at 4 kHz, each from -6 to +12 dB. They are set on their own and stay as they are whatever the
-//! mode, the points or the correction are changed to.
+//! **Bass, Sharpness and Softness** are a third curve, run after those two: a low shelf at 100 Hz and
+//! a high shelf at 4 kHz, each from -6 to +12 dB, and a broad dip around 3.5 kHz (where harshness
+//! lives) of as much as 6 dB. They are set on their own and stay as they are whatever the mode, the
+//! points or the correction are changed to.
+//!
+//! **How much of the correction** is applied can be set, from none of it to all of it (never more):
+//! every gain of the correction, in dB, is taken at that share.
+//!
+//! The sound passes them in this order: the correction, the curve set by hand (the mode), Bass,
+//! Sharpness, Softness; then Loudness and the limiter.
 //!
 //! **Speaker protection.** So that a raised curve cannot clip, the whole sound is turned down by the
 //! highest point of all three curves together (`headroom`): by the top of the curve they make, not by
@@ -71,8 +78,15 @@ pub const BASS_HZ: f32 = 100.0;
 pub const SHARPNESS_HZ: f32 = 4000.0;
 pub const LEAST_TONE: f32 = -6.0;
 pub const MOST_TONE: f32 = 12.0;
-/// the curves the sound passes, one after another: the one set by hand, the correction, Bass and Sharpness
+/// Softness: where its dip lies, how wide it is (it covers about 2 to 5 kHz), and the most it takes, in dB
+pub const SOFTNESS_HZ: f32 = 3500.0;
+const SOFTNESS_Q: f32 = 0.7;
+pub const MOST_SOFTNESS: f32 = -6.0;
+/// the curves the sound passes, one after another: the correction, the one set by hand, and Bass,
+/// Sharpness and Softness
 pub const LAYERS: usize = 3;
+/// which of them is the one set by hand
+pub const OWN: usize = 1;
 /// the most Loudness gives back, in dB
 pub const MOST_LOUDNESS: f32 = 12.0;
 /// the limiter's ceiling: -0.3 dB under full scale
@@ -223,14 +237,27 @@ impl Curve {
         headroom(&[*self], rate)
     }
 
-    /// Bass and Sharpness as a curve: a low shelf and a high shelf (nothing when both are at 0 dB).
-    fn tone(bass: f32, sharpness: f32) -> Curve {
+    /// Bass, Sharpness and Softness as a curve: a low shelf, a high shelf and a broad dip (nothing
+    /// when all are at 0 dB).
+    fn tone(bass: f32, sharpness: f32, softness: f32) -> Curve {
         let mut curve = Curve::default();
-        if bass != 0.0 || sharpness != 0.0 {
+        if bass != 0.0 || sharpness != 0.0 || softness != 0.0 {
             curve.points[0] = Point { hz: BASS_HZ, db: bass, q: CUT_Q, kind: Some(Kind::LowShelf) };
             curve.points[1] = Point { hz: SHARPNESS_HZ, db: sharpness, q: CUT_Q, kind: Some(Kind::HighShelf) };
-            curve.count = 2;
+            curve.points[2] = Point { hz: SOFTNESS_HZ, db: softness, q: SOFTNESS_Q, kind: Some(Kind::Peak) };
+            curve.count = 3;
         }
+        curve
+    }
+
+    /// The curve with every gain at a share of what it is (1: as it is; 0: nothing, its cuts too).
+    pub fn scaled(&self, share: f32) -> Curve {
+        let mut curve = *self;
+        if share <= 0.0 {
+            return Curve::default();
+        }
+        curve.gains.iter_mut().for_each(|g| *g *= share);
+        curve.points.iter_mut().for_each(|p| p.db *= share);
         curve
     }
 }
@@ -283,19 +310,22 @@ pub fn mode(wanted: &str) -> Result<Mode, String> {
     found.cloned().ok_or(format!("no mode is called \"{wanted}\" (there are: {})", all.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
-/// What is set on top of a mode: Bass, Sharpness and Loudness in dB, and whether the sound is turned
-/// down beforehand for the curve's highest point (speaker protection).
+/// What is set on top of a mode: Bass, Sharpness, Loudness and Softness in dB, how much of the
+/// correction is applied in percent, and whether the sound is turned down beforehand for the curve's
+/// highest point (speaker protection).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Tone {
     pub bass: f32,
     pub sharpness: f32,
     pub loudness: f32,
+    pub softness: f32,
+    pub correction: f32,
     pub protect: bool,
 }
 
 impl Default for Tone {
     fn default() -> Tone {
-        Tone { bass: 0.0, sharpness: 0.0, loudness: 0.0, protect: true }
+        Tone { bass: 0.0, sharpness: 0.0, loudness: 0.0, softness: 0.0, correction: 100.0, protect: true }
     }
 }
 
@@ -305,9 +335,10 @@ pub const BY_HAND: &str = "by hand";
 const TONES: &str = "tone.txt";
 
 /// The tone each mode was left with, and the mode last used, so that a mode comes back with its own
-/// and the window opens as it was left. A line is `Mode = bass sharpness loudness` (in dB), with
-/// `unprotected` after them when speaker protection is off, and `@last = Mode`; `#` begins a remark.
-/// A mode that is not written has all three at 0 and is protected.
+/// and the window opens as it was left. A line is `Mode = bass sharpness loudness softness correction`
+/// (four in dB, the last in percent), with `unprotected` after them when speaker protection is off,
+/// and `@last = Mode`; `#` begins a remark. A mode that is not written has the four at 0, all of the
+/// correction, and is protected.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Tones {
     pub last: String,
@@ -326,8 +357,10 @@ impl Tones {
             match numbers.as_slice() {
                 _ if name == "@last" => tones.last = said.trim().to_string(),
                 // two numbers: as it was written before there was Loudness
-                [Some(bass), Some(sharpness)] => tones.set(name, Tone { bass: *bass, sharpness: *sharpness, loudness: 0.0, protect }),
-                [Some(bass), Some(sharpness), Some(loudness)] => tones.set(name, Tone { bass: *bass, sharpness: *sharpness, loudness: *loudness, protect }),
+                // two or three numbers: as it was written before there was Loudness, and Softness and Correction
+                [Some(bass), Some(sharpness)] => tones.set(name, Tone { bass: *bass, sharpness: *sharpness, protect, ..Tone::default() }),
+                [Some(bass), Some(sharpness), Some(loudness)] => tones.set(name, Tone { bass: *bass, sharpness: *sharpness, loudness: *loudness, protect, ..Tone::default() }),
+                [Some(bass), Some(sharpness), Some(loudness), Some(softness), Some(correction)] => tones.set(name, Tone { bass: *bass, sharpness: *sharpness, loudness: *loudness, softness: *softness, correction: *correction, protect }),
                 _ => {}
             }
         }
@@ -335,8 +368,8 @@ impl Tones {
     }
 
     pub fn written(&self) -> String {
-        let each: String = self.each.iter().map(|(mode, t)| format!("{mode} = {:+.1} {:+.1} {:+.1}{}\n", t.bass, t.sharpness, t.loudness, if t.protect { "" } else { " unprotected" })).collect();
-        format!("# Bottle EQ: Bass, Sharpness and Loudness (dB) as they were left in each mode, and the mode last used\n@last = {}\n{each}", self.last)
+        let each: String = self.each.iter().map(|(mode, t)| format!("{mode} = {:+.1} {:+.1} {:+.1} {:+.1} {:.0}{}\n", t.bass, t.sharpness, t.loudness, t.softness, t.correction, if t.protect { "" } else { " unprotected" })).collect();
+        format!("# Bottle EQ: Bass, Sharpness, Loudness and Softness (dB) and Correction (%) as they were left in each mode, and the mode last used\n@last = {}\n{each}", self.last)
     }
 
     /// The ones kept in `tone.txt` (none when there is no such file).
@@ -355,7 +388,14 @@ impl Tones {
 
     pub fn set(&mut self, mode: &str, tone: Tone) {
         self.each.retain(|t| t.0 != mode);
-        let tone = Tone { bass: tone.bass.clamp(LEAST_TONE, MOST_TONE), sharpness: tone.sharpness.clamp(LEAST_TONE, MOST_TONE), loudness: tone.loudness.clamp(0.0, MOST_LOUDNESS), protect: tone.protect };
+        let tone = Tone {
+            bass: tone.bass.clamp(LEAST_TONE, MOST_TONE),
+            sharpness: tone.sharpness.clamp(LEAST_TONE, MOST_TONE),
+            loudness: tone.loudness.clamp(0.0, MOST_LOUDNESS),
+            softness: tone.softness.clamp(MOST_SOFTNESS, 0.0),
+            correction: tone.correction.clamp(0.0, 100.0),
+            protect: tone.protect,
+        };
         if tone != Tone::default() {
             self.each.push((mode.to_string(), tone));
         }
@@ -420,6 +460,10 @@ pub struct Settings {
     tone: [AtomicU32; 2],
     /// Loudness in dB: given back to the whole sound after the headroom
     loudness: AtomicU32,
+    /// Softness in dB (0 or less): a broad dip around 3.5 kHz, with Bass and Sharpness
+    softness: AtomicU32,
+    /// how much of the correction is applied, in percent: 100 is all of it, and there is no more
+    strength: AtomicU32,
     /// speaker protection: the whole sound is turned down beforehand by the curves' highest point.
     /// false: it is not, and the limiter alone keeps the sound from clipping
     pub protect: AtomicBool,
@@ -430,7 +474,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { own: Kept::default(), under: Kept::default(), on: AtomicBool::new(true), correcting: AtomicBool::new(true), tone: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())), loudness: AtomicU32::new(0f32.to_bits()), protect: AtomicBool::new(true), volume: AtomicU32::new(0f32.to_bits()), limited: AtomicU32::new(0f32.to_bits()) }
+        Settings { own: Kept::default(), under: Kept::default(), on: AtomicBool::new(true), correcting: AtomicBool::new(true), tone: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())), loudness: AtomicU32::new(0f32.to_bits()), softness: AtomicU32::new(0f32.to_bits()), strength: AtomicU32::new(100f32.to_bits()), protect: AtomicBool::new(true), volume: AtomicU32::new(0f32.to_bits()), limited: AtomicU32::new(0f32.to_bits()) }
     }
 }
 
@@ -468,14 +512,36 @@ impl Settings {
         f32::from_bits(self.loudness.load(Ordering::Relaxed))
     }
 
+    /// Softness in dB, 0 to -6: a gentle, wide dip around 3.5 kHz, where harshness lives; the bass
+    /// and the air above stay.
+    pub fn set_softness(&self, db: f32) {
+        self.softness.store(db.clamp(MOST_SOFTNESS, 0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn softness(&self) -> f32 {
+        f32::from_bits(self.softness.load(Ordering::Relaxed))
+    }
+
+    /// How much of the correction is applied, in percent: 0 none of it, 100 all of it. It cannot be
+    /// set over 100: a correction is never made stronger than it was measured to be.
+    pub fn set_strength(&self, percent: f32) {
+        self.strength.store(percent.clamp(0.0, 100.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn strength(&self) -> f32 {
+        f32::from_bits(self.strength.load(Ordering::Relaxed))
+    }
+
     /// All that is set on top of a mode, as one.
     pub fn whole_tone(&self) -> Tone {
-        Tone { bass: self.tone().0, sharpness: self.tone().1, loudness: self.loudness(), protect: self.protect.load(Ordering::Relaxed) }
+        Tone { bass: self.tone().0, sharpness: self.tone().1, loudness: self.loudness(), softness: self.softness(), correction: self.strength(), protect: self.protect.load(Ordering::Relaxed) }
     }
 
     pub fn set_whole_tone(&self, tone: &Tone) {
         self.set_tone(tone.bass, tone.sharpness);
         self.set_loudness(tone.loudness);
+        self.set_softness(tone.softness);
+        self.set_strength(tone.correction);
         self.protect.store(tone.protect, Ordering::Relaxed);
     }
 
@@ -504,16 +570,22 @@ impl Settings {
         self.under.set_points(points);
     }
 
-    /// The correction that is set (all at 0 dB and no point: none).
+    /// The correction that is set, all of it (all at 0 dB and no point: none).
     pub fn correction(&self) -> Curve {
         self.under.get()
     }
 
-    /// The curves as they are set, whether the equalizer is on or not: the one set by hand, the
-    /// correction (nothing when it is left out), Bass and Sharpness.
+    /// The correction as much of it as is applied.
+    pub fn correction_applied(&self) -> Curve {
+        self.under.get().scaled(self.strength() / 100.0)
+    }
+
+    /// The curves as they are set, whether the equalizer is on or not, in the order the sound passes
+    /// them: the correction (as much of it as is applied; nothing when it is left out), the one set by
+    /// hand, and Bass, Sharpness and Softness.
     pub fn set_curves(&self) -> [Curve; LAYERS] {
         let (bass, sharpness) = self.tone();
-        [self.own.get(), if self.correcting.load(Ordering::Relaxed) { self.under.get() } else { Curve::default() }, Curve::tone(bass, sharpness)]
+        [if self.correcting.load(Ordering::Relaxed) { self.correction_applied() } else { Curve::default() }, self.own.get(), Curve::tone(bass, sharpness, self.softness())]
     }
 
     /// The curves as the sound passes them now: all nothing when the equalizer is off.
@@ -563,8 +635,8 @@ struct Filter {
 /// The equalizer as the audio thread runs it.
 pub struct Eq {
     rate: f64,
-    /// the curve set by hand (its ten bands, then its points), then the correction and Bass and
-    /// Sharpness (the same)
+    /// the correction (its ten bands, then its points), then the curve set by hand and Bass,
+    /// Sharpness and Softness (the same)
     filters: [Filter; LAYERS * EACH],
     /// the whole sound's gain now, in dB: the headroom and the volume, each on its way; and the headroom
     /// of the curves last seen
@@ -979,6 +1051,7 @@ mod tests {
         for hz in [60.0, 1000.0, 6000.0] {
             let set = Settings::default();
             set.set_tone(12.0, 9.0);
+            set.set_correction(&[0.0, 6.0, -4.0, 0.0, 0.0, 5.0, 0.0, -6.0, 0.0, 3.0], &[Point { hz: 5500.0, db: 9.0, q: 3.0, kind: Some(Kind::Peak) }]);
             let mut eq = Eq::new(RATE);
             let mut sound = sine(hz, 3.0);
             let slope = 0.25 * 2.0 * PI * hz / R; // the most a sine of this height moves in a frame
@@ -990,7 +1063,16 @@ mod tests {
                     450 => set.set_all(&mode("Treble Boost").unwrap().gains),
                     // the sliders themselves, pulled from one end to the other; then all of it off and on
                     550 => set.set_tone(-6.0, -6.0),
+                    // Softness pulled to its end and the correction to none of it, and both back
+                    600 => {
+                        set.set_softness(MOST_SOFTNESS);
+                        set.set_strength(0.0);
+                    }
                     650 => set.set_tone(12.0, 12.0),
+                    700 => {
+                        set.set_softness(0.0);
+                        set.set_strength(100.0);
+                    }
                     750 => set.on.store(false, Ordering::Relaxed),
                     850 => set.on.store(true, Ordering::Relaxed),
                     950 => set.flat(),
@@ -1088,7 +1170,7 @@ mod tests {
         let run = |loudness: f32, protect: bool| {
             let set = Settings::default();
             set.set_all(&mode("Deep Bass").unwrap().gains);
-            set.set_whole_tone(&Tone { bass: MOST_TONE, sharpness: MOST_TONE, loudness, protect });
+            set.set_whole_tone(&Tone { bass: MOST_TONE, sharpness: MOST_TONE, loudness, protect, ..Tone::default() });
             let (mut eq, mut sound) = (Eq::new(RATE), before.clone());
             sound.chunks_mut(144).for_each(|block| eq.process(block, 1, &set));
             let top = sound.iter().fold(0.0f32, |p, s| p.max(s.abs()));
@@ -1116,7 +1198,7 @@ mod tests {
     fn with_the_protection_off_the_limiter_alone_keeps_heavy_bass_whole() {
         let set = Settings::default();
         set.set_all(&mode("Deep Bass").unwrap().gains);
-        set.set_whole_tone(&Tone { bass: MOST_TONE, sharpness: MOST_TONE, loudness: MOST_LOUDNESS, protect: false });
+        set.set_whole_tone(&Tone { bass: MOST_TONE, sharpness: MOST_TONE, loudness: MOST_LOUDNESS, protect: false, ..Tone::default() });
         for hz in [40.0, 50.0, 1000.0] {
             let mut eq = Eq::new(RATE);
             let mut sound: Vec<f32> = (0..RATE * 3).map(|i| (2.0 * PI * hz * i as f64 / R).sin() as f32).collect();
@@ -1131,8 +1213,65 @@ mod tests {
     }
 
     #[test]
+    fn softness_takes_the_harshness_and_leaves_the_bass_and_the_air() {
+        let settings = Settings::default();
+        settings.set_all(&mode("Rock").unwrap().gains);
+        let before: Vec<f32> = [60.0, 200.0, 2000.0, 3500.0, 5000.0, 16000.0].iter().map(|hz| settings.response_db(R, *hz)).collect();
+        settings.set_softness(-6.0);
+        let took: Vec<f32> = [60.0, 200.0, 2000.0, 3500.0, 5000.0, 16000.0].iter().zip(&before).map(|(hz, b)| settings.response_db(R, *hz) - b).collect();
+        // all of it at 3.5 kHz, more than half of it from 2 to 5 kHz, next to nothing in the bass and little at the top
+        assert!((took[3] + 6.0).abs() < 0.05 && took[2] < -3.0 && took[4] < -3.0 && took[0].abs() < 0.05 && took[1].abs() < 0.3 && took[5] > -1.5, "took {took:?}");
+        // a dip takes no headroom, and the sound is what is said
+        assert!(settings.headroom(R) >= settings.get().headroom(R));
+        let mut eq = Eq::new(RATE);
+        let mut sound = sine(3500.0, 2.0);
+        sound.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
+        let came = 20.0 * (rms(&sound[48000..]) / rms(&sine(3500.0, 2.0)[48000..])).log10();
+        assert!((came - (settings.response_db(R, 3500.0) + settings.headroom(R)) as f64).abs() < 0.05, "came out at {came} dB");
+        // it cannot be set past its ends or turned into a boost; off takes it out with the rest
+        settings.set_softness(-20.0);
+        assert_eq!(settings.softness(), MOST_SOFTNESS);
+        settings.set_softness(3.0);
+        assert_eq!(settings.softness(), 0.0);
+        settings.set_softness(-6.0);
+        settings.on.store(false, Ordering::Relaxed);
+        assert_eq!(settings.response_db(R, 3500.0), 0.0);
+    }
+
+    #[test]
+    fn the_correction_is_applied_as_much_as_is_set_and_never_more() {
+        let settings = Settings::default();
+        let correction = [0.0, 6.0, -4.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0];
+        settings.set_correction(&correction, &[Point { hz: 3000.0, db: -8.0, q: 4.0, kind: Some(Kind::Peak) }]);
+        settings.set_all(&mode("Rock").unwrap().gains);
+        let own = |hz: f64| settings.get().response_db(R, hz);
+        let full: Vec<f32> = [63.0, 125.0, 2000.0, 3000.0].iter().map(|hz| settings.response_db(R, *hz) - own(*hz)).collect();
+        // half of it: every gain of the correction at half its dB, the mode on top as it was
+        settings.set_strength(50.0);
+        assert_eq!(settings.correction_applied().gains, [0.0, 3.0, -2.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0]);
+        assert_eq!(settings.correction_applied().points()[0].db, -4.0);
+        for (hz, full) in [63.0, 125.0, 2000.0, 3000.0].iter().zip(&full) {
+            let half = settings.response_db(R, *hz) - own(*hz);
+            assert!((half - full / 2.0).abs() < 0.35, "at {hz} Hz half the correction is {half} dB, all of it {full} dB");
+        }
+        // the sound is what is said
+        let mut eq = Eq::new(RATE);
+        let mut sound = sine(3000.0, 2.0);
+        sound.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
+        let came = 20.0 * (rms(&sound[48000..]) / rms(&sine(3000.0, 2.0)[48000..])).log10();
+        assert!((came - (settings.response_db(R, 3000.0) + settings.headroom(R)) as f64).abs() < 0.05, "came out at {came} dB");
+        // none of it: the mode alone; the correction that is kept is whole all the while
+        settings.set_strength(0.0);
+        assert!((settings.response_db(R, 3000.0) - own(3000.0)).abs() < 1e-6 && settings.correction_applied() == Curve::default());
+        assert_eq!(settings.correction().gains, correction);
+        // and it cannot be set over all of it
+        settings.set_strength(250.0);
+        assert_eq!((settings.strength(), settings.correction_applied()), (100.0, settings.correction()));
+    }
+
+    #[test]
     fn each_mode_keeps_its_own_bass_and_sharpness() {
-        let tone = |bass: f32, sharpness: f32, loudness: f32, protect: bool| Tone { bass, sharpness, loudness, protect };
+        let tone = |bass: f32, sharpness: f32, loudness: f32, protect: bool| Tone { bass, sharpness, loudness, protect, ..Tone::default() };
         let mut tones = Tones::default();
         tones.set("Deep Bass", tone(6.0, 0.5, 9.0, false));
         tones.set(BY_HAND, tone(-2.0, 3.0, 0.0, true));
@@ -1144,7 +1283,12 @@ mod tests {
         let read = Tones::read(&tones.written());
         assert_eq!(read, tones);
         tones.set("Vocal", Tone::default());
-        assert!(!tones.written().contains("Vocal") && tones.written().contains("@last = Deep Bass") && tones.written().contains("Pop = +0.0 +0.0 +0.0 unprotected"));
+        assert!(!tones.written().contains("Vocal") && tones.written().contains("@last = Deep Bass") && tones.written().contains("Pop = +0.0 +0.0 +0.0 +0.0 100 unprotected"));
+        // Softness and Correction are kept too, within their ends
+        tones.set("Rock", Tone { softness: -9.0, correction: 140.0, ..Tone::default() });
+        tones.set("Jazz", Tone { softness: -2.5, correction: 60.0, ..Tone::default() });
+        assert_eq!(tones.of("Rock"), Tone { softness: MOST_SOFTNESS, ..Tone::default() });
+        assert_eq!(Tones::read(&tones.written()).of("Jazz"), Tone { softness: -2.5, correction: 60.0, ..Tone::default() });
         // lines that say nothing are passed over; one from before there was Loudness is read
         assert_eq!(Tones::read("# a remark\n\nRock = 3\nPop = two 1\nJazz = 1.5 -1 # mine\n").each, vec![("Jazz".to_string(), tone(1.5, -1.0, 0.0, true))]);
         // and all of it goes to the settings and comes back as one

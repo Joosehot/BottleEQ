@@ -45,6 +45,8 @@
 //!   --bass <dB>              a low shelf at 100 Hz and a high shelf at 4 kHz (-6 to +12 dB each), on top
 //!   --sharpness <dB>         of whatever mode, points and calibration are set
 //!   --loudness <dB>          0 to +12: gives back what was turned down for a raised curve
+//!   --softness <dB>          0 to -6: a gentle, wide dip around 3.5 kHz, where harshness lives
+//!   --correction <percent>   how much of the calibration's correction is applied, 0 to 100 (all of it)
 //!   --unprotected            nothing is turned down for a raised curve: the limiter alone keeps it from clipping
 //!   --points <points>        points on top of the bands, as in FL Studio's EQ: each a filter of its own,
 //!                            e.g. --points "100:cut 1k:-2 12k:+8:spike" (a slope at the start, a dip, a
@@ -57,7 +59,7 @@
 //! put on top of it and leave it as it is, and so does "flat".
 //!
 //! While `run` plays, a line sets the curve: "mode rock", "modes", "points 100:cut 12k:+8:spike", "1k +3",
-//! "calibration speakers", "calibration none", "bass +6", "sharpness +3", "loudness +9", "protection off",
+//! "calibration speakers", "calibration none", "bass +6", "sharpness +3", "loudness +9", "protection off", "softness -3", "correction 50",
 //! "31.5 -2", "8 4" (the 8th band), "flat", "off", "on"; an empty line stops.
 //!
 //! The window begins at once when --exclusive or --shared is given with both devices; else it waits for
@@ -278,12 +280,12 @@ fn show_gains(gains: &Settings, rate: u32) {
     if !points.is_empty() {
         println!("points:     {}", points.join(" | "));
     }
-    if gains.tone() != (0.0, 0.0) {
-        println!("on top:     bass {:+.1} dB, sharpness {:+.1} dB", gains.tone().0, gains.tone().1);
+    if gains.tone() != (0.0, 0.0) || gains.softness() != 0.0 {
+        println!("on top:     bass {:+.1} dB, sharpness {:+.1} dB, softness {:+.1} dB", gains.tone().0, gains.tone().1, gains.softness());
     }
     let under = gains.correction();
     if under != eq::Curve::default() {
-        println!("under it, the correction: bands {} and {} points{}", under.gains.iter().map(|g| format!("{g:+.1}")).collect::<Vec<_>>().join(" "), under.points().len(), if gains.correcting.load(Ordering::Relaxed) { "" } else { " (left out)" });
+        println!("under it, the correction: bands {} and {} points{}", under.gains.iter().map(|g| format!("{g:+.1}")).collect::<Vec<_>>().join(" "), under.points().len(), if !gains.correcting.load(Ordering::Relaxed) { " (left out)".to_string() } else if gains.strength() < 100.0 { format!(" ({:.0} % of it applied)", gains.strength()) } else { String::new() });
     }
     match gains.on.load(Ordering::Relaxed) {
         true => println!(
@@ -354,6 +356,8 @@ fn main() {
     let volume: f32 = take("--volume").map(|s| s.parse().unwrap_or_else(|_| fail("--volume takes a number of dB, like +6"))).unwrap_or(0.0);
     let tone = |given: Option<String>, flag: &str| given.map(|s| s.parse::<f32>().unwrap_or_else(|_| fail(&format!("{flag} takes a number of dB, like +6"))));
     let (bass, sharpness, loudness) = (tone(take("--bass"), "--bass"), tone(take("--sharpness"), "--sharpness"), tone(take("--loudness"), "--loudness"));
+    let softness = tone(take("--softness"), "--softness");
+    let strength: Option<f32> = take("--correction").map(|s| s.trim_end_matches('%').parse().unwrap_or_else(|_| fail("--correction takes a percentage, like 60")));
     let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
     let (shot, drag) = (take("--shot"), take("--drag"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
@@ -373,6 +377,8 @@ fn main() {
     gains.set_volume(volume);
     gains.set_tone(bass.unwrap_or(0.0), sharpness.unwrap_or(0.0));
     gains.set_loudness(loudness.unwrap_or(0.0));
+    gains.set_softness(softness.unwrap_or(0.0));
+    gains.set_strength(strength.unwrap_or(100.0));
     gains.protect.store(!unprotected, Ordering::Relaxed);
     let given = gains_text.map(|g| parse_gains(&g));
     given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
@@ -411,7 +417,7 @@ fn main() {
                 to,
                 exclusive: if exclusive { Some(true) } else if shared { Some(false) } else { None },
                 cushion_ms,
-                tone_given: bass.is_some() || sharpness.is_some() || loudness.is_some() || unprotected,
+                tone_given: bass.is_some() || sharpness.is_some() || loudness.is_some() || softness.is_some() || strength.is_some() || unprotected,
                 curve_given: given.is_some() || points_text.is_some(),
                 settings: gains,
                 mode: mode_text,
@@ -670,6 +676,8 @@ fn main() {
                     ["bass", db] if db.parse::<f32>().is_ok() => g.set_tone(db.parse().unwrap_or(0.0), g.tone().1),
                     ["sharpness", db] if db.parse::<f32>().is_ok() => g.set_tone(g.tone().0, db.parse().unwrap_or(0.0)),
                     ["loudness", db] if db.parse::<f32>().is_ok() => g.set_loudness(db.parse().unwrap_or(0.0)),
+                    ["softness", db] if db.parse::<f32>().is_ok() => g.set_softness(db.parse().unwrap_or(0.0)),
+                    ["correction", percent] if percent.trim_end_matches('%').parse::<f32>().is_ok() => g.set_strength(percent.trim_end_matches('%').parse().unwrap_or(100.0)),
                     ["protection", "off"] => g.protect.store(false, Ordering::Relaxed),
                     ["protection", "on"] => g.protect.store(true, Ordering::Relaxed),
                     ["calibration", "none"] => g.set_correction(&[0.0; BANDS], &[]),

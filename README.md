@@ -8,6 +8,8 @@ Free, open-source speaker calibration and EQ for Windows and Linux. Make your sp
 - **Compare:** toggle on/off to hear the difference.
 
 ## Recently added
+- **Correction slider:** how strongly the calibration is applied, from 0% (no room correction) to 100% (the full calibrated correction, never more).
+- **Softness slider:** a gentle, wide cut around 3.5 kHz (0 to −6 dB) that makes the sound warmer and softer without losing bass or air.
 - **Loudness slider:** gives the volume back after a big boost (0 to +12 dB); a limiter keeps it from clipping.
 - **Speaker protection toggle:** on, boosts turn the sound down first so nothing is ever held back; off, it stays loud and the limiter does the work.
 - **Limiter readout:** the window shows how many dB the limiter is holding back.
@@ -217,6 +219,17 @@ on is drawn thin beside it when the two differ.
   Sound under the ceiling passes untouched. While it works the window says "⚠ limiter: -4.2 dB", how
   far it holds the loudest moments back. It does not look ahead: that would delay every sound 2 to 3 ms,
   bypassed or not.
+- **Softness** (0 to -6 dB) is a wide peaking cut centred at 3.5 kHz (Q 0.7, about 2 to 5 kHz), where
+  harshness lives: all of it at 3.5 kHz, more than half from 2 to 5 kHz, nothing in the bass and under
+  1.5 dB at 16 kHz.
+- **Correction** (0 to 100 %) scales the calibration: every gain of its correction, in dB, is taken at
+  that share. 100 % is the correction as it was measured and the slider goes no higher, so it cannot
+  overcorrect. It is greyed out ("Run calibration first") until a calibration is set. The calibration
+  that is kept stays whole.
+- The sound passes it all in this order: calibration (scaled by Correction), mode, Bass, Sharpness,
+  Softness, Loudness, limiter. Softness and Correction are kept per mode with the others, slide to
+  where they are set like every other gain (no clicks), and go with BYPASSED.
+- On the command line: `--softness <dB>`, `--correction <percent>`, and "softness -3", "correction 50" in `run`.
 - On the command line: `--bass <dB>`, `--sharpness <dB>`, `--loudness <dB>`, `--unprotected`, and "bass +6",
   "sharpness +3", "loudness +9", "protection off" as lines in `run`.
 

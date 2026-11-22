@@ -14,6 +14,9 @@
 //!   and correction are set, and stay when those are changed. The thick amber line is all of it
 //!   together, as the sound passes it; where that is more than the curve set by hand, the curve the
 //!   handles lie on is drawn thin beside it.
+//! - **Softness** takes a broad dip out around 3.5 kHz, where harshness lives, and **Correction** is
+//!   how much of the calibration's correction is applied, from none to all of it (greyed out until
+//!   there is a calibration).
 //! - **Loudness** gives back what was turned down for the raised curve, and **Speaker protection**
 //!   unticked leaves the turning down out altogether; the limiter then keeps the sound from clipping,
 //!   and how far it holds the sound back is said beside them. Each mode keeps its own Bass, Sharpness,
@@ -42,7 +45,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use eframe::egui::{self, pos2, Color32, FontId, Pos2, Rect, Sense, Stroke};
-use crate::eq::{self, Curve, Eq, Kind, Mode, Point, Settings, Tones, BANDS, BY_HAND, CENTRES, CUT_Q, MOST, POINTS, POINT_Q};
+use crate::eq::{self, Curve, Eq, Kind, Mode, Point, Settings, Tones, BANDS, BY_HAND, CENTRES, CUT_Q, MOST, OWN, POINTS, POINT_Q};
 use crate::ring::Ring;
 use crate::spectrum::{Spectrum, SIZE};
 use crate::audio::{self, run, Input, Output, Running};
@@ -328,27 +331,35 @@ impl Window {
         }
         let mut tone = self.settings.whole_tone();
         let (mut changed, mut settled) = (false, false);
-        // a slider with its value beside it and a button that puts it back to 0; it says whether it was
-        // moved, and whether it was let go of
-        let slider = |ui: &mut egui::Ui, name: &str, value: &mut f32, least: f32, most: f32, hint: &str| {
+        // a slider with its value beside it and a button that puts it back to where it begins; it says
+        // whether it was moved, and whether it was let go of. Greyed out, it says why instead.
+        let slider = |ui: &mut egui::Ui, name: &str, value: &mut f32, (least, most, home, step): (f32, f32, f32, f64), percent: bool, hint: &str, greyed: Option<&str>| {
             ui.label(name);
             ui.spacing_mut().slider_width = 150.0;
-            let moved = ui.add(egui::Slider::new(value, least..=most).step_by(0.5).custom_formatter(|db, _| format!("{db:+.1} dB"))).on_hover_text(hint);
-            let reset = ui.small_button("⟲").on_hover_text(format!("{name} back to 0 dB."));
+            let said = move |v: f64, _: std::ops::RangeInclusive<usize>| if percent { format!("{v:.0} %") } else { format!("{v:+.1} dB") };
+            let moved = ui.add_enabled(greyed.is_none(), egui::Slider::new(value, least..=most).step_by(step).custom_formatter(said)).on_hover_text(hint).on_disabled_hover_text(greyed.unwrap_or(""));
+            let back = if percent { format!("{name} back to {home:.0} %.") } else { format!("{name} back to {home:.0} dB.") };
+            let reset = ui.add_enabled(greyed.is_none(), egui::Button::new("⟲").small()).on_hover_text(back).on_disabled_hover_text(greyed.unwrap_or(""));
             if reset.clicked() {
-                *value = 0.0;
+                *value = home;
             }
             ui.add_space(10.0);
             (moved.changed() || reset.clicked(), moved.drag_stopped() || reset.clicked() || (moved.changed() && !moved.dragged()))
         };
         let mut note = |did: (bool, bool)| (changed, settled) = (changed | did.0, settled | did.1);
         let amber = Color32::from_rgb(255, 170, 60);
+        let db = (eq::LEAST_TONE, eq::MOST_TONE, 0.0, 0.5);
         ui.horizontal(|ui| {
-            note(slider(ui, "Bass", &mut tone.bass, eq::LEAST_TONE, eq::MOST_TONE, "More or less deep bass: everything below about 100 Hz, on top of the mode and the calibration.\nEach mode keeps its own."));
-            note(slider(ui, "Sharpness", &mut tone.sharpness, eq::LEAST_TONE, eq::MOST_TONE, "More or less clarity and crispness: everything above about 4 kHz, on top of the mode and the calibration.\nEach mode keeps its own."));
+            note(slider(ui, "Bass", &mut tone.bass, db, false, "More or less deep bass: everything below about 100 Hz, on top of the mode and the calibration.\nEach mode keeps its own.", None));
+            note(slider(ui, "Sharpness", &mut tone.sharpness, db, false, "More or less clarity and crispness: everything above about 4 kHz, on top of the mode and the calibration.\nEach mode keeps its own.", None));
         });
         ui.horizontal(|ui| {
-            note(slider(ui, "Loudness", &mut tone.loudness, 0.0, eq::MOST_LOUDNESS, "Gives back what was turned down to make room for the raised curve. The limiter keeps it from clipping: it holds the loudest moments back.\nEach mode keeps its own."));
+            note(slider(ui, "Softness", &mut tone.softness, (eq::MOST_SOFTNESS, 0.0, 0.0, 0.5), false, "Warmer and softer: a gentle, wide dip around 3.5 kHz (about 2 to 5 kHz), where harshness lives. The bass and the air above stay.\nEach mode keeps its own.", None));
+            let none = self.settings.correction() == Curve::default();
+            note(slider(ui, "Correction", &mut tone.correction, (0.0, 100.0, 100.0, 1.0), true, "How much of the calibration's correction is applied: 0 % none of it, 100 % all of it as it was measured. It cannot be set higher, so it never overcorrects.\nEach mode keeps its own.", none.then_some("Run calibration first")));
+        });
+        ui.horizontal(|ui| {
+            note(slider(ui, "Loudness", &mut tone.loudness, (0.0, eq::MOST_LOUDNESS, 0.0, 0.5), false, "Gives back what was turned down to make room for the raised curve. The limiter keeps it from clipping: it holds the loudest moments back.\nEach mode keeps its own.", None));
             let ticked = ui.checkbox(&mut tone.protect, "Speaker protection").on_hover_text("Ticked: the whole sound is turned down beforehand by the curve's highest point, so that nothing is ever held back. Safe, and quieter.\nUnticked: nothing is turned down beforehand; the limiter alone keeps the sound from clipping. Louder, and heavy bass can make cheap speakers distort.\nEach mode keeps its own.");
             note((ticked.changed(), ticked.changed()));
             if !tone.protect {
@@ -857,11 +868,11 @@ impl Window {
         let drawn = line_of(&all);
         let colour = if on { AMBER } else { Color32::from_gray(120) };
         // where more than the curve set by hand is in it, that curve is drawn thin: its handles lie on it
-        if all[1..].iter().any(|c| *c != Curve::default()) {
+        if all.iter().enumerate().any(|(layer, c)| layer != OWN && *c != Curve::default()) {
             painter.line(line_of(&[curve]), Stroke::new(1.0, colour.gamma_multiply(0.55)));
         }
         // the correction under it: a curve of its own, thin and pale, with no handles
-        let lies_under = self.settings.correction();
+        let lies_under = self.settings.correction_applied();
         if lies_under != Curve::default() {
             let pale = if on && self.settings.correcting.load(Ordering::Relaxed) { Color32::from_rgb(235, 215, 170) } else { Color32::from_gray(95) };
             let line: Vec<Pos2> = (0..=across).map(|step| pos2(graph.left() + step as f32 * 2.0, y_of(graph, lies_under.response_db(rate, hz_at(graph, graph.left() + step as f32 * 2.0) as f64)))).collect();
@@ -1109,7 +1120,7 @@ pub fn open(start: Start) -> Result<(), String> {
         window.start();
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([820.0, 520.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
+        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([820.0, 550.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
         ..Default::default()
     };
     eframe::run_native("Bottle EQ", options, Box::new(move |made| {
