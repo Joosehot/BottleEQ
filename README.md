@@ -7,6 +7,11 @@ Free, open-source speaker calibration and EQ for Windows and Linux. Make your sp
 - **EQ:** shape the sound yourself, like a bass boost.
 - **Compare:** toggle on/off to hear the difference.
 
+## Best setting for bass boosted music
+- **Bass:** +5.0 dB
+- **Sharpness:** +5.0 dB
+- **Volume:** cranked up
+
 ## Recently added
 - **Loudness slider:** gives the volume back after a big boost (0 to +12 dB); a limiter keeps it from clipping.
 - **Speaker protection toggle:** on, boosts turn the sound down first so nothing is ever held back; off, it stays loud and the limiter does the work.
