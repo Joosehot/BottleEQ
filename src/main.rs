@@ -44,6 +44,8 @@
 //!   --volume <dB>            the whole sound louder (up to +18) or quieter; a limiter keeps it from clipping
 //!   --bass <dB>              a low shelf at 100 Hz and a high shelf at 4 kHz (-6 to +12 dB each), on top
 //!   --sharpness <dB>         of whatever mode, points and calibration are set
+//!   --loudness <dB>          0 to +12: gives back what was turned down for a raised curve
+//!   --unprotected            nothing is turned down for a raised curve: the limiter alone keeps it from clipping
 //!   --points <points>        points on top of the bands, as in FL Studio's EQ: each a filter of its own,
 //!                            e.g. --points "100:cut 1k:-2 12k:+8:spike" (a slope at the start, a dip, a
 //!                            spike at the end); see `points_of` for how a point is written
@@ -55,7 +57,7 @@
 //! put on top of it and leave it as it is, and so does "flat".
 //!
 //! While `run` plays, a line sets the curve: "mode rock", "modes", "points 100:cut 12k:+8:spike", "1k +3",
-//! "calibration speakers", "calibration none", "bass +6", "sharpness +3",
+//! "calibration speakers", "calibration none", "bass +6", "sharpness +3", "loudness +9", "protection off",
 //! "31.5 -2", "8 4" (the 8th band), "flat", "off", "on"; an empty line stops.
 //!
 //! The window begins at once when --exclusive or --shared is given with both devices; else it waits for
@@ -284,7 +286,12 @@ fn show_gains(gains: &Settings, rate: u32) {
         println!("under it, the correction: bands {} and {} points{}", under.gains.iter().map(|g| format!("{g:+.1}")).collect::<Vec<_>>().join(" "), under.points().len(), if gains.correcting.load(Ordering::Relaxed) { "" } else { " (left out)" });
     }
     match gains.on.load(Ordering::Relaxed) {
-        true => println!("            turned down {:.1} dB for headroom{}", -gains.headroom(rate as f64), if gains.volume() != 0.0 { format!("; volume {:+.1} dB", gains.volume()) } else { String::new() }),
+        true => println!(
+            "            {}{}{}",
+            if gains.protect.load(Ordering::Relaxed) { format!("turned down {:.1} dB for headroom", -gains.headroom(rate as f64)) } else { "speaker protection off: nothing turned down for headroom".to_string() },
+            if gains.loudness() != 0.0 { format!("; loudness {:+.1} dB", gains.loudness()) } else { String::new() },
+            if gains.volume() != 0.0 { format!("; volume {:+.1} dB", gains.volume()) } else { String::new() }
+        ),
         false => println!("            off: the sound passes untouched"),
     }
 }
@@ -346,7 +353,7 @@ fn main() {
     let (kind, like_text) = (take("--type").unwrap_or("speakers".to_string()), take("--like"));
     let volume: f32 = take("--volume").map(|s| s.parse().unwrap_or_else(|_| fail("--volume takes a number of dB, like +6"))).unwrap_or(0.0);
     let tone = |given: Option<String>, flag: &str| given.map(|s| s.parse::<f32>().unwrap_or_else(|_| fail(&format!("{flag} takes a number of dB, like +6"))));
-    let (bass, sharpness) = (tone(take("--bass"), "--bass"), tone(take("--sharpness"), "--sharpness"));
+    let (bass, sharpness, loudness) = (tone(take("--bass"), "--bass"), tone(take("--sharpness"), "--sharpness"), tone(take("--loudness"), "--loudness"));
     let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
     let (shot, drag) = (take("--shot"), take("--drag"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
@@ -358,13 +365,15 @@ fn main() {
         None => false,
     };
     let (exclusive, shared, measure_flag, correct) = (flag("--exclusive"), flag("--shared"), flag("--measure"), flag("--correct"));
-    let (test_flag, guess_flag) = (flag("--test"), flag("--guess"));
+    let (test_flag, guess_flag, unprotected) = (flag("--test"), flag("--guess"), flag("--unprotected"));
     // a measured curve is turned over exactly, unless the careful way is asked for
     let gentle = flag("--gentle");
     let how = if gentle { &calibrate::GENTLE } else { &calibrate::EXACT };
     let gains = Arc::new(Settings::default());
     gains.set_volume(volume);
     gains.set_tone(bass.unwrap_or(0.0), sharpness.unwrap_or(0.0));
+    gains.set_loudness(loudness.unwrap_or(0.0));
+    gains.protect.store(!unprotected, Ordering::Relaxed);
     let given = gains_text.map(|g| parse_gains(&g));
     given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
     // a mode is a named set of the ten bands' gains; points are filters of their own on top
@@ -402,7 +411,7 @@ fn main() {
                 to,
                 exclusive: if exclusive { Some(true) } else if shared { Some(false) } else { None },
                 cushion_ms,
-                tone_given: bass.is_some() || sharpness.is_some(),
+                tone_given: bass.is_some() || sharpness.is_some() || loudness.is_some() || unprotected,
                 curve_given: given.is_some() || points_text.is_some(),
                 settings: gains,
                 mode: mode_text,
@@ -660,6 +669,9 @@ fn main() {
                     ["volume", db] if db.parse::<f32>().is_ok() => g.set_volume(db.parse().unwrap_or(0.0)),
                     ["bass", db] if db.parse::<f32>().is_ok() => g.set_tone(db.parse().unwrap_or(0.0), g.tone().1),
                     ["sharpness", db] if db.parse::<f32>().is_ok() => g.set_tone(g.tone().0, db.parse().unwrap_or(0.0)),
+                    ["loudness", db] if db.parse::<f32>().is_ok() => g.set_loudness(db.parse().unwrap_or(0.0)),
+                    ["protection", "off"] => g.protect.store(false, Ordering::Relaxed),
+                    ["protection", "on"] => g.protect.store(true, Ordering::Relaxed),
                     ["calibration", "none"] => g.set_correction(&[0.0; BANDS], &[]),
                     ["calibration", name @ ..] if !name.is_empty() => match calibrate::calibration(&name.join(" ")) {
                         Ok(calibration) => {

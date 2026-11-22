@@ -7,9 +7,11 @@ Free, open-source speaker calibration and EQ for Windows and Linux. Make your sp
 - **EQ:** shape the sound yourself, like a bass boost.
 - **Compare:** toggle on/off to hear the difference.
 
-## New features
+## Recently added
+- **Loudness slider:** gives the volume back after a big boost (0 to +12 dB); a limiter keeps it from clipping.
+- **Speaker protection toggle:** on, boosts turn the sound down first so nothing is ever held back; off, it stays loud and the limiter does the work.
+- **Limiter readout:** the window shows how many dB the limiter is holding back.
 - **Bass and Sharpness sliders:** more deep bass or more crispness on top of any mode.
-- **Speaker protection:** boosts never clip, and a limiter holds heavy bass back (the window warns when it works).
 - **Each mode remembers its sliders**, and the window opens in the mode you left it in.
 - **EQ ON / BYPASSED:** one button to hear the difference.
 - **Camera mic warning:** you are told if the calibration mic is a webcam's.
@@ -185,22 +187,49 @@ where they are, and BYPASSED takes them out with everything else. The thick ambe
 is all of it together (calibration + mode + sliders), drawn as it is set; the curve the handles lie
 on is drawn thin beside it when the two differ.
 
-- **Each mode keeps its own two.** Deep Bass with Bass at +6 comes back at +6 when it is chosen again.
+- **Each mode keeps its own** Bass, Sharpness, Loudness and protection. Deep Bass with Bass at +6 comes
+  back at +6 when it is chosen again.
   They are kept in `tone.txt` in the folder Bottle EQ is run from, with the mode last used: the window
   opens in that mode.
-- **Speaker protection.** When the boost goes up the whole sound is turned down by the same amount
-  (the highest point of all three curves together), so a full-scale sound still fits. With the
-  Volume turned up past that, a limiter at the very end holds the loudest moments back: the whole
-  sound is turned down just enough the moment it would go over full scale, and held there through a
-  bass wave so the wave keeps its shape. The window says "⚠ limiter working" while it does. It keeps
-  the sound from clipping; it cannot know what a speaker's cone can take, so very deep bass at a
-  high volume is still the listener's to judge.
-- On the command line: `--bass <dB>`, `--sharpness <dB>`, and "bass +6", "sharpness +3" as lines in `run`.
+- **Speaker protection** (ticked by default). When the boost goes up the whole sound is turned down
+  beforehand by the highest point of the combined curve (calibration + mode + Bass + Sharpness): by
+  the top of that curve, not by the boosts added up, and not at all when nothing is raised. A
+  full-scale sound then still fits and nothing is ever held back. It is safe and it is quiet: Deep
+  Bass with both sliders at +12 dB is turned down 19 dB.
+- **Loudness** (0 to +12 dB, the slider under Bass) gives that back, after the equalizer and before
+  the limiter.
+- **Protection off** (unticked): nothing is turned down beforehand. The window then says "⚠ off: cheap
+  speakers may distort": the limiter keeps the sound from clipping, but a speaker driven hard with deep
+  bass can distort by itself, and that is the listener's to judge.
+- **The limiter** stands last of all, always. Its ceiling is -0.3 dB under full scale: the moment the
+  sound would pass it the whole sound is turned down just enough, held there through a bass wave (a
+  twentieth of a second, so the wave keeps its shape) and let back up over a twelfth of a second.
+  Sound under the ceiling passes untouched. While it works the window says "⚠ limiter: -4.2 dB", how
+  far it holds the loudest moments back. It does not look ahead: that would delay every sound 2 to 3 ms,
+  bypassed or not.
+- On the command line: `--bass <dB>`, `--sharpness <dB>`, `--loudness <dB>`, `--unprotected`, and "bass +6",
+  "sharpness +3", "loudness +9", "protection off" as lines in `run`.
 
 Tested in the engine (`cargo test`): what comes out is what the curves say within 0.05 dB; modes
 changed, the sliders pulled from end to end and the equalizer switched off and on with both sliders
-up make no jump in a sine at 60 Hz, 1 kHz or 6 kHz (none over 4.5 times the sine's own steepest step); Deep Bass with both sliders at +12 dB and the
-Volume at +18 dB on a full-scale 50 Hz sine never passes full scale and comes out a sine still.
+up make no jump in a sine at 60 Hz, 1 kHz or 6 kHz (none over 4.5 times the sine's own steepest step);
+Deep Bass with both sliders at +12 dB, Loudness at +12 dB and the protection off on a full-scale
+sine at 40 Hz, 50 Hz and 1 kHz never passes the ceiling and comes out a sine still.
+
+How loud Deep Bass with both sliders at +12 dB is, against the sound with the equalizer off. The
+sound is noise shaped like loud music (3 dB less an octave, its highest sample at full scale), the
+hardest case there is: a record that is already at full height has no room for 20 dB more bass, so
+what is not turned down beforehand is held back by the limiter.
+
+| | all of the sound | its mids (300 Hz to 3 kHz) | highest sample |
+|---|---|---|---|
+| protected, Loudness 0 | -7.9 dB | -17.7 dB | 0.588 |
+| protected, Loudness +12 | +2.7 dB | -7.0 dB | 0.966 |
+| protection off, Loudness 0 | +3.3 dB | -6.2 dB | 0.966 |
+
+So with Loudness up or the protection off the sound as a whole is as loud as it came (3 dB louder:
+the bass that was asked for), and nothing passes the ceiling. The mids stand 6 to 7 dB under where
+they were with the equalizer off; with quieter music, or less boost, less.
 
 ## Measure and calibrate
 

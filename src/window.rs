@@ -11,10 +11,14 @@
 //!   or take it away. **Right button or double click on the empty graph**: a new point there.
 //! - **Flat** puts the bands and the points back to nothing: the sound passes as it came.
 //! - **Bass** and **Sharpness**, the two sliders at the top, are put on top of whatever mode, points
-//!   and correction are set, and stay when those are changed. Each mode keeps its own two (`eq::Tones`,
-//!   in `tone.txt`), and the window opens in the mode it was left in. The thick amber line is all of
-//!   it together, as the sound passes it; where that is more than the curve set by hand, the curve the
+//!   and correction are set, and stay when those are changed. The thick amber line is all of it
+//!   together, as the sound passes it; where that is more than the curve set by hand, the curve the
 //!   handles lie on is drawn thin beside it.
+//! - **Loudness** gives back what was turned down for the raised curve, and **Speaker protection**
+//!   unticked leaves the turning down out altogether; the limiter then keeps the sound from clipping,
+//!   and how far it holds the sound back is said beside them. Each mode keeps its own Bass, Sharpness,
+//!   Loudness and protection (`eq::Tones`, in `tone.txt`), and the window opens in the mode it was
+//!   left in.
 //! - **Measure** plays a sweep out of the speakers and records it with the microphone chosen
 //!   (`measure.rs`); what reached the microphone is drawn in blue on the curve's scale, dotted where it
 //!   is not to be believed. It can be measured again at any time; the line is the last one.
@@ -72,7 +76,7 @@ pub struct Start {
     pub cushion_ms: f32,
     pub settings: Arc<Settings>,
     pub mode: Option<String>,
-    /// Bass or Sharpness, and the bands or points, were set on the command line: they are left as
+    /// Bass, Sharpness, Loudness or the protection, and the bands or points, were set on the command line: they are left as
     /// they are, and what was kept from last time is not put in their place
     pub tone_given: bool,
     pub curve_given: bool,
@@ -316,44 +320,53 @@ impl Window {
         // another mode: its own two come back. Bands moved by hand keep the two they had.
         let key = self.tone_key();
         if key != self.tone_mode {
-            let (bass, sharpness) = if key == BY_HAND { self.settings.tone() } else { self.tones.of(&key) };
-            self.settings.set_tone(bass, sharpness);
-            self.tones.set(&key, bass, sharpness);
+            let tone = if key == BY_HAND { self.settings.whole_tone() } else { self.tones.of(&key) };
+            self.settings.set_whole_tone(&tone);
+            self.tones.set(&key, tone);
             (self.tones.last, self.tone_mode) = (key.clone(), key.clone());
             self.keep_tones();
         }
+        let mut tone = self.settings.whole_tone();
+        let (mut changed, mut settled) = (false, false);
+        // a slider with its value beside it and a button that puts it back to 0; it says whether it was
+        // moved, and whether it was let go of
+        let slider = |ui: &mut egui::Ui, name: &str, value: &mut f32, least: f32, most: f32, hint: &str| {
+            ui.label(name);
+            ui.spacing_mut().slider_width = 150.0;
+            let moved = ui.add(egui::Slider::new(value, least..=most).step_by(0.5).custom_formatter(|db, _| format!("{db:+.1} dB"))).on_hover_text(hint);
+            let reset = ui.small_button("⟲").on_hover_text(format!("{name} back to 0 dB."));
+            if reset.clicked() {
+                *value = 0.0;
+            }
+            ui.add_space(10.0);
+            (moved.changed() || reset.clicked(), moved.drag_stopped() || reset.clicked() || (moved.changed() && !moved.dragged()))
+        };
+        let mut note = |did: (bool, bool)| (changed, settled) = (changed | did.0, settled | did.1);
+        let amber = Color32::from_rgb(255, 170, 60);
         ui.horizontal(|ui| {
-            let (mut bass, mut sharpness) = self.settings.tone();
-            let (mut changed, mut settled) = (false, false);
-            let sliders = [
-                ("Bass", &mut bass, "More or less deep bass: everything below about 100 Hz, on top of the mode and the calibration."),
-                ("Sharpness", &mut sharpness, "More or less clarity and crispness: everything above about 4 kHz, on top of the mode and the calibration."),
-            ];
-            for (name, value, hint) in sliders {
-                ui.label(name);
-                ui.spacing_mut().slider_width = 150.0;
-                let slider = egui::Slider::new(value, eq::LEAST_TONE..=eq::MOST_TONE).step_by(0.5).custom_formatter(|db, _| format!("{db:+.1} dB"));
-                let moved = ui.add(slider).on_hover_text(format!("{hint}\nEach mode keeps its own. Raised, the rest is turned down as much, so nothing clips."));
-                let reset = ui.small_button("⟲").on_hover_text(format!("{name} back to 0 dB."));
-                if reset.clicked() {
-                    *value = 0.0;
-                }
-                changed |= moved.changed() || reset.clicked();
-                settled |= moved.drag_stopped() || reset.clicked() || (moved.changed() && !moved.dragged());
-                ui.add_space(10.0);
+            note(slider(ui, "Bass", &mut tone.bass, eq::LEAST_TONE, eq::MOST_TONE, "More or less deep bass: everything below about 100 Hz, on top of the mode and the calibration.\nEach mode keeps its own."));
+            note(slider(ui, "Sharpness", &mut tone.sharpness, eq::LEAST_TONE, eq::MOST_TONE, "More or less clarity and crispness: everything above about 4 kHz, on top of the mode and the calibration.\nEach mode keeps its own."));
+        });
+        ui.horizontal(|ui| {
+            note(slider(ui, "Loudness", &mut tone.loudness, 0.0, eq::MOST_LOUDNESS, "Gives back what was turned down to make room for the raised curve. The limiter keeps it from clipping: it holds the loudest moments back.\nEach mode keeps its own."));
+            let ticked = ui.checkbox(&mut tone.protect, "Speaker protection").on_hover_text("Ticked: the whole sound is turned down beforehand by the curve's highest point, so that nothing is ever held back. Safe, and quieter.\nUnticked: nothing is turned down beforehand; the limiter alone keeps the sound from clipping. Louder, and heavy bass can make cheap speakers distort.\nEach mode keeps its own.");
+            note((ticked.changed(), ticked.changed()));
+            if !tone.protect {
+                ui.label(egui::RichText::new("⚠ off: cheap speakers may distort").color(amber).small());
             }
-            if changed {
-                self.settings.set_tone(bass, sharpness);
-                self.tones.set(&key, bass, sharpness);
-            }
-            if settled {
-                self.keep_tones();
-            }
-            if self.limited > 0.05 {
-                ui.label(egui::RichText::new(format!("⚠ limiter working: {:.1} dB", self.limited)).color(Color32::from_rgb(255, 170, 60)).strong())
-                    .on_hover_text("The sound would be louder than the speakers can be given, so its loudest moments are held back. Turn the Volume, Bass or Sharpness down for it to pass untouched.");
+            // what touches the ceiling and no more (a record at full height) is not worth saying
+            if self.limited > 0.4 {
+                ui.label(egui::RichText::new(format!("⚠ limiter: -{:.1} dB", self.limited)).color(amber).strong())
+                    .on_hover_text("The sound would be louder than the speakers can be given, so its loudest moments are held back by this much. Turn Loudness, the Volume, Bass or Sharpness down for it to pass untouched.");
             }
         });
+        if changed {
+            self.settings.set_whole_tone(&tone);
+            self.tones.set(&key, tone);
+        }
+        if settled {
+            self.keep_tones();
+        }
     }
 
     fn top_rows(&mut self, ui: &mut egui::Ui) {
@@ -1033,8 +1046,8 @@ pub fn open(start: Start) -> Result<(), String> {
     }
     let tone_mode = if mode.is_empty() { BY_HAND.to_string() } else { mode.clone() };
     match start.tone_given {
-        true => tones.set(&tone_mode, start.settings.tone().0, start.settings.tone().1),
-        false => start.settings.set_tone(tones.of(&tone_mode).0, tones.of(&tone_mode).1),
+        true => tones.set(&tone_mode, start.settings.whole_tone()),
+        false => start.settings.set_whole_tone(&tones.of(&tone_mode)),
     }
     // Linux: nothing is taken from anyone by starting, so it starts as soon as it knows where to play
     let begin = (start.exclusive.is_some() || cfg!(target_os = "linux")) && source.is_some() && target.is_some();
@@ -1096,7 +1109,7 @@ pub fn open(start: Start) -> Result<(), String> {
         window.start();
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([820.0, 490.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
+        viewport: egui::ViewportBuilder::default().with_title("Bottle EQ").with_inner_size([820.0, 520.0]).with_min_inner_size([520.0, 300.0]).with_always_on_top().with_drag_and_drop(false),
         ..Default::default()
     };
     eframe::run_native("Bottle EQ", options, Box::new(move |made| {
