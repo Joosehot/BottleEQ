@@ -307,6 +307,21 @@ fn describe(running: &Running, source: &Output, target: &Output) {
     println!("audio threads with Windows' Pro Audio priority: {}", if with == 2 { "yes" } else { "NO" });
 }
 
+/// Started by itself (a double click, a shortcut), the program is given a terminal window of its own
+/// that the window has no use for: it is let go of. A terminal it was started from is another's
+/// too, and is kept, so that what is printed is still read there.
+#[cfg(windows)]
+fn leave_own_terminal() {
+    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut held = [0u32; 2];
+    if unsafe { GetConsoleProcessList(&mut held) } == 1 {
+        let _ = unsafe { FreeConsole() };
+    }
+}
+
+#[cfg(not(windows))]
+fn leave_own_terminal() {}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut take = |flag: &str| -> Option<String> {
@@ -365,6 +380,7 @@ fn main() {
 
     match args.first().map(String::as_str) {
         None | Some("window") => {
+            leave_own_terminal();
             let drag = drag.map(|d| {
                 let parts: Vec<&str> = d.split(':').collect();
                 match parts.as_slice() {
