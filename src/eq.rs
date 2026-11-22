@@ -16,7 +16,8 @@
 //!   peak (FL Studio's own layout).
 //!
 //! A band or point at 0 dB does nothing at all and is skipped, so with everything at 0 (and no cut) the
-//! sound leaves exactly as it came.
+//! sound leaves exactly as it came. (One that has just come down to 0 dB is run a moment longer, until
+//! what it remembers has died away: taken out at once, the last of it would be a small step in the sound.)
 //!
 //! The filters are RBJ's ("Audio EQ Cookbook") biquads, in the shape of Vuuvee's `dsp/biquad.rs`:
 //! direct form I, in 64-bit floats (at 31.5 Hz a 32-bit state would hiss).
@@ -31,13 +32,19 @@
 //! a point is put on speakers that are already set right, and changing or flattening the curve on top
 //! leaves the correction as it is.
 //!
-//! So that a raised curve cannot clip, the whole sound is turned down by the curve's highest point
-//! (`headroom`).
+//! **Bass and Sharpness** are a third curve, run after those two: a low shelf at 100 Hz and a high
+//! shelf at 4 kHz, each from -6 to +12 dB. They are set on their own and stay as they are whatever the
+//! mode, the points or the correction are changed to.
+//!
+//! So that a raised curve cannot clip, the whole sound is turned down by the highest point of all
+//! three curves together (`headroom`).
 //!
 //! **Volume** is a gain on the whole sound after that, from -40 to +18 dB. Turned up it can give back
 //! what the headroom took, and more; then a sound at full height would no longer fit, so a limiter
-//! stands after it: the moment a frame would go over full scale the whole sound is turned down just
-//! enough (at once, all channels alike), and let back up over a sixth of a second. Nothing ever clips;
+//! stands last of all: the moment a frame would go over full scale the whole sound is turned down just
+//! enough (at once, all channels alike), held there while the sound keeps coming that high (a twentieth
+//! of a second covers a wave of the deepest bass, so a held-back wave keeps its shape), and then let
+//! back up over a sixth of a second. Nothing ever clips;
 //! what it costs is that the loudest moments are held back, which is said (`Settings::limited`).
 
 use std::f64::consts::PI;
@@ -54,14 +61,25 @@ pub const POINT_Q: f32 = 0.9;
 pub const CUT_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// the furthest a gain can be set, in dB
 pub const MOST: f32 = 12.0;
+/// Bass and Sharpness: where the low shelf and the high shelf turn, and the ends each can be set to, in dB
+pub const BASS_HZ: f32 = 100.0;
+pub const SHARPNESS_HZ: f32 = 4000.0;
+pub const LEAST_TONE: f32 = -6.0;
+pub const MOST_TONE: f32 = 12.0;
+/// the curves the sound passes, one after another: the one set by hand, the correction, Bass and Sharpness
+pub const LAYERS: usize = 3;
 /// the volume's ends, in dB
 pub const QUIETEST: f32 = -40.0;
 pub const LOUDEST: f32 = 18.0;
 /// how long the limiter takes to let the sound back up, in seconds
 const LET_UP: f64 = 0.16;
+/// and how long it waits after the last frame that came near full scale before it begins to, in seconds
+const HOLD: f64 = 0.05;
 /// how far a gain moves in one block, in dB (a block is about 3 ms), and a frequency, as a ratio
 const STEP: f32 = 0.25;
 const SLIDE: f32 = 1.06;
+/// how long a filter that has come down to 0 dB is still run, in seconds
+const DIE_AWAY: f64 = 0.15;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -193,16 +211,28 @@ impl Curve {
     /// How far the whole sound is turned down so that the curve's highest point is at 0 dB: 0 or less.
     #[cfg(test)]
     pub fn headroom(&self, rate: f64) -> f32 {
-        self.headroom_on(&Curve::default(), rate)
+        headroom(&[*self], rate)
     }
 
-    /// The same for this curve on another (a correction under it): by the highest point of the two together.
-    pub fn headroom_on(&self, under: &Curve, rate: f64) -> f32 {
-        // the curves, looked at every twelfth of an octave from 20 Hz up, and at every band and point
-        let between = (0..121).map(|i| 20.0 * 2f64.powf(i as f64 / 12.0));
-        let at = between.chain(CENTRES.iter().map(|c| *c as f64)).chain(self.points().iter().chain(under.points()).map(|p| p.hz as f64));
-        -at.map(|hz| self.response_db(rate, hz.min(0.49 * rate)) + under.response_db(rate, hz.min(0.49 * rate))).fold(0.0f32, f32::max)
+    /// Bass and Sharpness as a curve: a low shelf and a high shelf (nothing when both are at 0 dB).
+    fn tone(bass: f32, sharpness: f32) -> Curve {
+        let mut curve = Curve::default();
+        if bass != 0.0 || sharpness != 0.0 {
+            curve.points[0] = Point { hz: BASS_HZ, db: bass, q: CUT_Q, kind: Some(Kind::LowShelf) };
+            curve.points[1] = Point { hz: SHARPNESS_HZ, db: sharpness, q: CUT_Q, kind: Some(Kind::HighShelf) };
+            curve.count = 2;
+        }
+        curve
     }
+}
+
+/// How far the whole sound is turned down so that the highest point of curves run one after another
+/// is at 0 dB: 0 or less.
+pub fn headroom(curves: &[Curve], rate: f64) -> f32 {
+    // the curves, looked at every twelfth of an octave from 20 Hz up, and at every band and point
+    let between = (0..121).map(|i| 20.0 * 2f64.powf(i as f64 / 12.0));
+    let at = between.chain(CENTRES.iter().map(|c| *c as f64)).chain(curves.iter().flat_map(|c| c.points()).map(|p| p.hz as f64));
+    -at.map(|hz| curves.iter().map(|c| c.response_db(rate, hz.min(0.49 * rate))).sum::<f32>()).fold(0.0f32, f32::max)
 }
 
 /// A mode: a named set of the ten bands' gains.
@@ -242,6 +272,63 @@ pub fn mode(wanted: &str) -> Result<Mode, String> {
     let w = key(wanted);
     let found = all.iter().find(|m| key(&m.name) == w).or_else(|| all.iter().find(|m| key(&m.name).starts_with(&w))).or_else(|| all.iter().find(|m| key(&m.name).contains(&w)));
     found.cloned().ok_or(format!("no mode is called \"{wanted}\" (there are: {})", all.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")))
+}
+
+/// What Bass and Sharpness are kept under when the bands were moved by hand and no mode is set.
+pub const BY_HAND: &str = "by hand";
+/// The file they are kept in, in the folder Bottle EQ is run from.
+const TONES: &str = "tone.txt";
+
+/// Bass and Sharpness as they were left in each mode, and the mode last used, so that a mode comes
+/// back with its own two and the window opens as it was left. A line is `Mode = bass sharpness`
+/// (in dB), and `@last = Mode`; `#` begins a remark. A mode that is not written has both at 0.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct Tones {
+    pub last: String,
+    each: Vec<(String, f32, f32)>,
+}
+
+impl Tones {
+    /// What a text says; a line that is not understood is passed over.
+    pub fn read(text: &str) -> Tones {
+        let mut tones = Tones::default();
+        for line in text.lines() {
+            let Some((name, said)) = line.split('#').next().unwrap_or("").split_once('=') else { continue };
+            let (name, numbers) = (name.trim(), said.split_whitespace().map(|n| n.parse::<f32>().ok()).collect::<Vec<_>>());
+            match numbers.as_slice() {
+                _ if name == "@last" => tones.last = said.trim().to_string(),
+                [Some(bass), Some(sharpness)] => tones.set(name, *bass, *sharpness),
+                _ => {}
+            }
+        }
+        tones
+    }
+
+    pub fn written(&self) -> String {
+        let each: String = self.each.iter().map(|(mode, bass, sharpness)| format!("{mode} = {bass:+.1} {sharpness:+.1}\n")).collect();
+        format!("# Bottle EQ: Bass and Sharpness (dB) as they were left in each mode, and the mode last used\n@last = {}\n{each}", self.last)
+    }
+
+    /// The ones kept in `tone.txt` (none when there is no such file).
+    pub fn kept() -> Tones {
+        Tones::read(&std::fs::read_to_string(TONES).unwrap_or_default())
+    }
+
+    pub fn keep(&self) -> Result<(), String> {
+        std::fs::write(TONES, self.written()).map_err(|e| format!("{TONES}: {e}"))
+    }
+
+    /// Bass and Sharpness of a mode.
+    pub fn of(&self, mode: &str) -> (f32, f32) {
+        self.each.iter().find(|t| t.0 == mode).map_or((0.0, 0.0), |t| (t.1, t.2))
+    }
+
+    pub fn set(&mut self, mode: &str, bass: f32, sharpness: f32) {
+        self.each.retain(|t| t.0 != mode);
+        if bass != 0.0 || sharpness != 0.0 {
+            self.each.push((mode.to_string(), bass.clamp(LEAST_TONE, MOST_TONE), sharpness.clamp(LEAST_TONE, MOST_TONE)));
+        }
+    }
 }
 
 const KINDS: [Kind; 5] = [Kind::LowCut, Kind::LowShelf, Kind::Peak, Kind::HighShelf, Kind::HighCut];
@@ -298,6 +385,8 @@ pub struct Settings {
     pub on: AtomicBool,
     /// false: the correction is left out (to hear what it does)
     pub correcting: AtomicBool,
+    /// Bass and Sharpness in dB: two shelves after both curves
+    tone: [AtomicU32; 2],
     /// the volume in dB, and the most the limiter held the sound back since it was last asked, in dB
     volume: AtomicU32,
     limited: AtomicU32,
@@ -305,7 +394,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { own: Kept::default(), under: Kept::default(), on: AtomicBool::new(true), correcting: AtomicBool::new(true), volume: AtomicU32::new(0f32.to_bits()), limited: AtomicU32::new(0f32.to_bits()) }
+        Settings { own: Kept::default(), under: Kept::default(), on: AtomicBool::new(true), correcting: AtomicBool::new(true), tone: std::array::from_fn(|_| AtomicU32::new(0f32.to_bits())), volume: AtomicU32::new(0f32.to_bits()), limited: AtomicU32::new(0f32.to_bits()) }
     }
 }
 
@@ -321,6 +410,17 @@ impl Settings {
 
     pub fn volume(&self) -> f32 {
         f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
+    /// Bass and Sharpness in dB (0: nothing). They stay as they are when the curve, a mode or the
+    /// correction is changed.
+    pub fn set_tone(&self, bass: f32, sharpness: f32) {
+        self.tone[0].store(bass.clamp(LEAST_TONE, MOST_TONE).to_bits(), Ordering::Relaxed);
+        self.tone[1].store(sharpness.clamp(LEAST_TONE, MOST_TONE).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn tone(&self) -> (f32, f32) {
+        (f32::from_bits(self.tone[0].load(Ordering::Relaxed)), f32::from_bits(self.tone[1].load(Ordering::Relaxed)))
     }
 
     /// The most the limiter held the sound back since this was last asked, in dB (0: it did not).
@@ -353,11 +453,16 @@ impl Settings {
         self.under.get()
     }
 
-    /// The two curves as the sound passes them now: (the one set by hand, the correction), each
-    /// nothing when it is switched off.
-    pub fn passed(&self) -> [Curve; 2] {
-        let on = self.on.load(Ordering::Relaxed);
-        [if on { self.own.get() } else { Curve::default() }, if on && self.correcting.load(Ordering::Relaxed) { self.under.get() } else { Curve::default() }]
+    /// The curves as they are set, whether the equalizer is on or not: the one set by hand, the
+    /// correction (nothing when it is left out), Bass and Sharpness.
+    pub fn set_curves(&self) -> [Curve; LAYERS] {
+        let (bass, sharpness) = self.tone();
+        [self.own.get(), if self.correcting.load(Ordering::Relaxed) { self.under.get() } else { Curve::default() }, Curve::tone(bass, sharpness)]
+    }
+
+    /// The curves as the sound passes them now: all nothing when the equalizer is off.
+    pub fn passed(&self) -> [Curve; LAYERS] {
+        if self.on.load(Ordering::Relaxed) { self.set_curves() } else { [Curve::default(); LAYERS] }
     }
 
     /// How many dB the sound is changed at a frequency by all that it passes now.
@@ -367,8 +472,7 @@ impl Settings {
 
     /// How far the whole sound is turned down for headroom now: 0 or less.
     pub fn headroom(&self, rate: f64) -> f32 {
-        let [own, under] = self.passed();
-        own.headroom_on(&under, rate)
+        headroom(&self.passed(), rate)
     }
 
     /// The flat curve: every band at 0 dB, every point at 0 dB where it is, and no cut. The correction
@@ -395,24 +499,30 @@ struct Filter {
     db: f32,
     q: f32,
     coef: Coef,
-    /// in the sound: a filter at 0 dB that is not a cut is left out
+    /// in the sound: a filter at 0 dB that is not a cut is left out, once it has been there for `rest` frames
     live: bool,
+    rest: usize,
 }
 
 /// The equalizer as the audio thread runs it.
 pub struct Eq {
     rate: f64,
-    /// the curve set by hand (its ten bands, then its points), then the correction (the same)
-    filters: [Filter; 2 * EACH],
-    /// the whole sound's gain now, in dB (the headroom and the volume, on their way), and the headroom
-    /// of the curve last seen
+    /// the curve set by hand (its ten bands, then its points), then the correction and Bass and
+    /// Sharpness (the same)
+    filters: [Filter; LAYERS * EACH],
+    /// the whole sound's gain now, in dB: the headroom and the volume, each on its way; and the headroom
+    /// of the curves last seen
     level: f32,
-    seen: [Curve; 2],
+    room_now: f32,
+    volume_now: f32,
+    seen: [Curve; LAYERS],
     room: f32,
     /// the limiter: what the sound is held back to now (1: not at all)
     held: f64,
+    /// frames since one came near full scale as it is held
+    since: usize,
     /// memory[channel][filter]
-    memory: Vec<[Memory; 2 * EACH]>,
+    memory: Vec<[Memory; LAYERS * EACH]>,
 }
 
 /// the filters of one curve
@@ -424,18 +534,19 @@ impl Eq {
         let filters = std::array::from_fn(|i| {
             let i = i % EACH;
             let (kind, hz, q) = if i < BANDS { (band_kind(i), CENTRES[i], BAND_Q) } else { (Kind::Peak, 1000.0, POINT_Q) };
-            Filter { kind, hz, db: 0.0, q, coef: coef(kind, hz, 0.0, q, rate), live: false }
+            Filter { kind, hz, db: 0.0, q, coef: coef(kind, hz, 0.0, q, rate), live: false, rest: 0 }
         });
-        Eq { rate, filters, level: 0.0, seen: [Curve::default(); 2], room: 0.0, held: 1.0, memory: Vec::new() }
+        Eq { rate, filters, level: 0.0, room_now: 0.0, volume_now: 0.0, seen: [Curve::default(); LAYERS], room: 0.0, held: 1.0, since: 0, memory: Vec::new() }
     }
 
     /// One block of interleaved frames, equalized in place toward the curve set.
     pub fn process(&mut self, sound: &mut [f32], channels: usize, settings: &Settings) {
         if self.memory.len() != channels {
-            self.memory = vec![[Memory::default(); 2 * EACH]; channels];
+            self.memory = vec![[Memory::default(); LAYERS * EACH]; channels];
         }
         let sets = settings.passed();
-        for i in 0..2 * EACH {
+        let frames = sound.len() / channels.max(1);
+        for i in 0..LAYERS * EACH {
             // what this filter is set to be: (kind, frequency, gain, width), or nothing (a point not there)
             let (set, at) = (&sets[i / EACH], i % EACH);
             let want = match at.checked_sub(BANDS) {
@@ -455,12 +566,14 @@ impl Eq {
                     f.db += (db - f.db).clamp(-STEP, STEP);
                     f.hz *= (hz / f.hz).clamp(1.0 / SLIDE, SLIDE);
                     f.q *= (q / f.q).clamp(1.0 / SLIDE, SLIDE);
-                    f.live = kind.is_cut() || f.db != 0.0;
+                    f.rest = if f.db != 0.0 { (DIE_AWAY * self.rate) as usize } else { f.rest.saturating_sub(frames) };
+                    f.live = kind.is_cut() || f.db != 0.0 || (f.live && f.rest > 0);
                 }
                 // a point taken away goes down to nothing first
                 None => {
                     f.db -= f.db.clamp(-STEP, STEP);
-                    f.live = !f.kind.is_cut() && f.db != 0.0;
+                    f.rest = if f.db != 0.0 { (DIE_AWAY * self.rate) as usize } else { f.rest.saturating_sub(frames) };
+                    f.live = !f.kind.is_cut() && (f.db != 0.0 || (f.live && f.rest > 0));
                 }
             }
             if f.live && before != (f.kind, f.hz, f.db, f.q, f.live) {
@@ -468,17 +581,20 @@ impl Eq {
             }
         }
         if sets != self.seen {
-            (self.seen, self.room) = (sets, sets[0].headroom_on(&sets[1], self.rate));
+            (self.seen, self.room) = (sets, headroom(&sets, self.rate));
         }
         let level_before = self.level;
-        // the volume moves four times as fast as a curve's gain: it is a knob that is turned
-        let aim = self.room + settings.volume();
-        self.level += (aim - self.level).clamp(-4.0 * STEP, 4.0 * STEP);
+        // the volume moves four times as fast as a curve's gain: it is a knob that is turned. So does
+        // the headroom on its way down (a curve being raised must find its room there); on its way up it
+        // goes no faster than one gain comes down, or the sound would swell while the curve is still high
+        let slid = |now: f32, aim: f32, down: f32, up: f32| if (aim - now).abs() <= up.min(down) { aim } else { now + (aim - now).clamp(-down, up) };
+        self.room_now = slid(self.room_now, self.room, 4.0 * STEP, STEP);
+        self.volume_now = slid(self.volume_now, settings.volume(), 4.0 * STEP, 4.0 * STEP);
+        self.level = self.room_now + self.volume_now;
         if self.filters.iter().all(|f| !f.live) && self.level == 0.0 && level_before == 0.0 && self.held == 1.0 {
             return; // flat: the sound is left exactly as it came
         }
 
-        let frames = sound.len() / channels;
         let (from, to) = (10f64.powf(level_before as f64 / 20.0), 10f64.powf(self.level as f64 / 20.0));
         for (c, memory) in self.memory.iter_mut().enumerate() {
             for (i, frame) in sound.chunks_mut(channels).enumerate() {
@@ -494,13 +610,17 @@ impl Eq {
                 frame[c] = (s * (from + (to - from) * (i + 1) as f64 / frames as f64)) as f32;
             }
         }
-        // the limiter, when the volume is up over what the headroom allows (or it is still letting up)
-        if self.level.max(level_before) > self.room || self.held < 1.0 {
+        // the limiter, last of all: it has work when the volume is up over what the headroom allows, and
+        // watches the rest of the time (a curve on its way can pass over what its headroom was made for)
+        {
             let up = 1.0 - (-1.0 / (LET_UP * self.rate)).exp();
             let mut least = 1.0f64;
             for frame in sound.chunks_mut(channels) {
                 let peak = frame.iter().fold(0.0f32, |p, s| p.max(s.abs())) as f64;
-                self.held += (1.0 - self.held) * up;
+                self.since = if peak * self.held > 0.95 { 0 } else { self.since + 1 };
+                if self.since as f64 > HOLD * self.rate {
+                    self.held += (1.0 - self.held) * up;
+                }
                 if peak * self.held > 1.0 {
                     self.held = 1.0 / peak;
                 }
@@ -759,6 +879,125 @@ mod tests {
             }
         }
         assert!(jump < slope * 4.5, "a jump of {jump:.4} (the sine alone: {slope:.4})");
+    }
+
+    #[test]
+    fn bass_and_sharpness_lie_on_top_of_the_mode_and_the_correction() {
+        let settings = Settings::default();
+        let deep = mode("Deep Bass").unwrap();
+        settings.set_all(&deep.gains);
+        settings.set_correction(&[0.0, 0.0, -4.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0], &[]);
+        let before: Vec<f32> = [30.0, 100.0, 1000.0, 4000.0, 16000.0].iter().map(|hz| settings.response_db(R, *hz)).collect();
+        settings.set_tone(6.0, 4.0);
+        let added: Vec<f32> = [30.0, 100.0, 1000.0, 4000.0, 16000.0].iter().zip(&before).map(|(hz, b)| settings.response_db(R, *hz) - b).collect();
+        // a shelf is its whole gain past its end, half of it where it turns, and nothing far away
+        assert!((added[0] - 6.0).abs() < 0.3 && (added[1] - 3.0).abs() < 0.3 && added[2].abs() < 0.3 && (added[3] - 2.0).abs() < 0.3 && (added[4] - 4.0).abs() < 0.3, "added {added:?}");
+        // the mode and the correction are as they were, and another mode leaves the two as they are
+        assert!(settings.get().gains == deep.gains && settings.correction().gains[6] == 5.0);
+        settings.set_all(&mode("Vocal").unwrap().gains);
+        settings.flat();
+        assert_eq!(settings.tone(), (6.0, 4.0));
+        assert!((settings.response_db(R, 30.0) - 6.0).abs() < 0.3);
+        // the sound is what is said, with the headroom of all of it
+        settings.set_all(&deep.gains);
+        for hz in [40.0, 100.0, 1000.0, 9000.0] {
+            let mut eq = Eq::new(RATE);
+            let mut sound = sine(hz, 2.0);
+            sound.chunks_mut(128).for_each(|block| eq.process(block, 1, &settings));
+            let came = 20.0 * (rms(&sound[48000..]) / rms(&sine(hz, 2.0)[48000..])).log10();
+            let said = (settings.response_db(R, hz) + settings.headroom(R)) as f64;
+            assert!((came - said).abs() < 0.05, "at {hz} Hz the sound came out at {came} dB, the curves say {said} dB");
+        }
+        assert!(settings.headroom(R) < -13.0, "the headroom is {} dB", settings.headroom(R));
+        // they cannot be set past their ends, and off takes them out with the rest
+        settings.set_tone(-20.0, 20.0);
+        assert_eq!(settings.tone(), (LEAST_TONE, MOST_TONE));
+        settings.on.store(false, Ordering::Relaxed);
+        assert_eq!((settings.response_db(R, 30.0), settings.headroom(R)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn modes_changed_with_bass_and_sharpness_up_do_not_click() {
+        for hz in [60.0, 1000.0, 6000.0] {
+            let set = Settings::default();
+            set.set_tone(12.0, 9.0);
+            let mut eq = Eq::new(RATE);
+            let mut sound = sine(hz, 3.0);
+            let slope = 0.25 * 2.0 * PI * hz / R; // the most a sine of this height moves in a frame
+            let (mut last, mut jump, mut top) = (0.0f32, 0.0f64, 0.0f32);
+            for (n, block) in sound.chunks_mut(144).enumerate() {
+                match n {
+                    150 => set.set_all(&mode("Deep Bass").unwrap().gains),
+                    300 => set.set_all(&mode("Vocal").unwrap().gains),
+                    450 => set.set_all(&mode("Treble Boost").unwrap().gains),
+                    // the sliders themselves, pulled from one end to the other; then all of it off and on
+                    550 => set.set_tone(-6.0, -6.0),
+                    650 => set.set_tone(12.0, 12.0),
+                    750 => set.on.store(false, Ordering::Relaxed),
+                    850 => set.on.store(true, Ordering::Relaxed),
+                    950 => set.flat(),
+                    _ => {}
+                }
+                eq.process(block, 1, &set);
+                for s in block.iter() {
+                    jump = jump.max((*s - last).abs() as f64);
+                    top = top.max(s.abs());
+                    last = *s;
+                }
+            }
+            assert!(jump < slope * 4.5 + 0.002, "at {hz} Hz a jump of {jump:.4} (the sine alone: {slope:.4})");
+            assert!(top <= 1.0);
+        }
+    }
+
+    #[test]
+    fn heavy_bass_at_full_volume_is_held_back_and_never_clips() {
+        // the deepest mode, Bass at its most, the volume at its most, and a sound at full height
+        let set = Settings::default();
+        set.set_all(&mode("Deep Bass").unwrap().gains);
+        set.set_tone(12.0, 12.0);
+        set.set_volume(LOUDEST);
+        let mut eq = Eq::new(RATE);
+        let full = |hz: f64| -> Vec<f32> { (0..RATE * 3).map(|i| (2.0 * PI * hz * i as f64 / R).sin() as f32).collect() };
+        let mut sound = full(50.0);
+        for (n, block) in sound.chunks_mut(144).enumerate() {
+            if n == 400 {
+                set.set_all(&mode("Rock").unwrap().gains);
+            }
+            eq.process(block, 1, &set);
+        }
+        assert!(sound.iter().all(|s| s.abs() <= 1.0), "the loudest sample is {}", sound.iter().fold(0.0f32, |p, s| p.max(s.abs())));
+        assert!(set.limited() > 10.0);
+        // held back evenly: what comes out is still a sine at full height, not one with its top cut off
+        let end = &sound[RATE as usize * 2..];
+        let top = end.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+        assert!(top > 0.9 && (rms(end) / top as f64 - std::f64::consts::FRAC_1_SQRT_2).abs() < 0.02, "top {top}, rms {}", rms(end));
+        // and with the volume where it was, the headroom alone is enough: the limiter has nothing to do
+        set.set_volume(0.0);
+        let mut again = full(50.0);
+        again.chunks_mut(144).for_each(|block| eq.process(block, 1, &set));
+        set.limited();
+        let mut more = full(50.0);
+        more.chunks_mut(144).for_each(|block| eq.process(block, 1, &set));
+        assert!(more.iter().all(|s| s.abs() <= 1.0));
+        assert_eq!(set.limited(), 0.0);
+    }
+
+    #[test]
+    fn each_mode_keeps_its_own_bass_and_sharpness() {
+        let mut tones = Tones::default();
+        tones.set("Deep Bass", 6.0, 0.5);
+        tones.set(BY_HAND, -2.0, 3.0);
+        tones.set("Vocal", 0.0, 20.0);
+        tones.last = "Deep Bass".to_string();
+        assert_eq!((tones.of("Deep Bass"), tones.of(BY_HAND), tones.of("Vocal"), tones.of("Jazz")), ((6.0, 0.5), (-2.0, 3.0), (0.0, MOST_TONE), (0.0, 0.0)));
+        // written and read again they are the same; a mode put back to nothing is no longer written
+        let read = Tones::read(&tones.written());
+        assert_eq!(read, tones);
+        tones.set("Vocal", 0.0, 0.0);
+        assert!(!tones.written().contains("Vocal") && tones.written().contains("@last = Deep Bass"));
+        // lines that say nothing are passed over
+        assert_eq!(Tones::read("# a remark\n\nRock = 3\nPop = two 1\nJazz = 1.5 -1 # mine\n").each, vec![("Jazz".to_string(), 1.5, -1.0)]);
     }
 
     #[test]

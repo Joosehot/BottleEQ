@@ -10,6 +10,11 @@
 //! - **Right button on a point**: its kind (a slope at the start or the end, a shelf, a peak, a spike),
 //!   or take it away. **Right button or double click on the empty graph**: a new point there.
 //! - **Flat** puts the bands and the points back to nothing: the sound passes as it came.
+//! - **Bass** and **Sharpness**, the two sliders at the top, are put on top of whatever mode, points
+//!   and correction are set, and stay when those are changed. Each mode keeps its own two (`eq::Tones`,
+//!   in `tone.txt`), and the window opens in the mode it was left in. The thick amber line is all of
+//!   it together, as the sound passes it; where that is more than the curve set by hand, the curve the
+//!   handles lie on is drawn thin beside it.
 //! - **Measure** plays a sweep out of the speakers and records it with the microphone chosen
 //!   (`measure.rs`); what reached the microphone is drawn in blue on the curve's scale, dotted where it
 //!   is not to be believed. It can be measured again at any time; the line is the last one.
@@ -33,7 +38,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use eframe::egui::{self, pos2, Color32, FontId, Pos2, Rect, Sense, Stroke};
-use crate::eq::{self, Curve, Eq, Kind, Mode, Point, Settings, BANDS, CENTRES, CUT_Q, MOST, POINTS, POINT_Q};
+use crate::eq::{self, Curve, Eq, Kind, Mode, Point, Settings, Tones, BANDS, BY_HAND, CENTRES, CUT_Q, MOST, POINTS, POINT_Q};
 use crate::ring::Ring;
 use crate::spectrum::{Spectrum, SIZE};
 use crate::audio::{self, run, Input, Output, Running};
@@ -67,6 +72,10 @@ pub struct Start {
     pub cushion_ms: f32,
     pub settings: Arc<Settings>,
     pub mode: Option<String>,
+    /// Bass or Sharpness, and the bands or points, were set on the command line: they are left as
+    /// they are, and what was kept from last time is not put in their place
+    pub tone_given: bool,
+    pub curve_given: bool,
     /// for trying it out: a WAV played to the source at a level, a point dragged by itself to a
     /// frequency and gain, and a picture of the window kept after some seconds, after which it closes
     pub play: Option<(String, f32)>,
@@ -177,6 +186,9 @@ struct Window {
     modes: Vec<Mode>,
     /// the mode the bands were set from; empty when they were moved by hand
     mode: String,
+    /// Bass and Sharpness as each mode was left with them, and the mode the two sliders now belong to
+    tones: Tones,
+    tone_mode: String,
     on_top: bool,
     /// the handle being dragged, and the point (and place) the menu was opened on
     held: Option<Hold>,
@@ -288,7 +300,64 @@ impl Window {
         self.target.map_or(48000.0, |t| self.outputs[t].rate as f64)
     }
 
+    /// The mode Bass and Sharpness are kept under now.
+    fn tone_key(&self) -> String {
+        if self.mode.is_empty() { BY_HAND.to_string() } else { self.mode.clone() }
+    }
+
+    fn keep_tones(&mut self) {
+        if let Err(e) = self.tones.keep() {
+            self.said = e;
+        }
+    }
+
+    /// Bass and Sharpness: on top of whatever mode and correction are set.
+    fn tone_row(&mut self, ui: &mut egui::Ui) {
+        // another mode: its own two come back. Bands moved by hand keep the two they had.
+        let key = self.tone_key();
+        if key != self.tone_mode {
+            let (bass, sharpness) = if key == BY_HAND { self.settings.tone() } else { self.tones.of(&key) };
+            self.settings.set_tone(bass, sharpness);
+            self.tones.set(&key, bass, sharpness);
+            (self.tones.last, self.tone_mode) = (key.clone(), key.clone());
+            self.keep_tones();
+        }
+        ui.horizontal(|ui| {
+            let (mut bass, mut sharpness) = self.settings.tone();
+            let (mut changed, mut settled) = (false, false);
+            let sliders = [
+                ("Bass", &mut bass, "More or less deep bass: everything below about 100 Hz, on top of the mode and the calibration."),
+                ("Sharpness", &mut sharpness, "More or less clarity and crispness: everything above about 4 kHz, on top of the mode and the calibration."),
+            ];
+            for (name, value, hint) in sliders {
+                ui.label(name);
+                ui.spacing_mut().slider_width = 150.0;
+                let slider = egui::Slider::new(value, eq::LEAST_TONE..=eq::MOST_TONE).step_by(0.5).custom_formatter(|db, _| format!("{db:+.1} dB"));
+                let moved = ui.add(slider).on_hover_text(format!("{hint}\nEach mode keeps its own. Raised, the rest is turned down as much, so nothing clips."));
+                let reset = ui.small_button("⟲").on_hover_text(format!("{name} back to 0 dB."));
+                if reset.clicked() {
+                    *value = 0.0;
+                }
+                changed |= moved.changed() || reset.clicked();
+                settled |= moved.drag_stopped() || reset.clicked() || (moved.changed() && !moved.dragged());
+                ui.add_space(10.0);
+            }
+            if changed {
+                self.settings.set_tone(bass, sharpness);
+                self.tones.set(&key, bass, sharpness);
+            }
+            if settled {
+                self.keep_tones();
+            }
+            if self.limited > 0.05 {
+                ui.label(egui::RichText::new(format!("⚠ limiter working: {:.1} dB", self.limited)).color(Color32::from_rgb(255, 170, 60)).strong())
+                    .on_hover_text("The sound would be louder than the speakers can be given, so its loudest moments are held back. Turn the Volume, Bass or Sharpness down for it to pass untouched.");
+            }
+        });
+    }
+
     fn top_rows(&mut self, ui: &mut egui::Ui) {
+        self.tone_row(ui);
         ui.horizontal(|ui| {
             match self.running.is_some() {
                 true => {
@@ -759,17 +828,25 @@ impl Window {
             }
         });
 
-        // the curve, and its points on it
+        // the curve: all that is set together (the curve set by hand, the correction, Bass and Sharpness)
         let curve = self.settings.get();
+        let all = self.settings.set_curves();
         let (rate, on) = (self.rate(), self.settings.on.load(Ordering::Relaxed));
         let across = (graph.width() / 2.0) as usize;
-        let drawn: Vec<Pos2> = (0..=across)
-            .map(|step| {
-                let x = graph.left() + step as f32 * 2.0;
-                pos2(x, y_of(graph, curve.response_db(rate, hz_at(graph, x) as f64)))
-            })
-            .collect();
+        let line_of = |curves: &[Curve]| -> Vec<Pos2> {
+            (0..=across)
+                .map(|step| {
+                    let x = graph.left() + step as f32 * 2.0;
+                    pos2(x, y_of(graph, curves.iter().map(|c| c.response_db(rate, hz_at(graph, x) as f64)).sum()))
+                })
+                .collect()
+        };
+        let drawn = line_of(&all);
         let colour = if on { AMBER } else { Color32::from_gray(120) };
+        // where more than the curve set by hand is in it, that curve is drawn thin: its handles lie on it
+        if all[1..].iter().any(|c| *c != Curve::default()) {
+            painter.line(line_of(&[curve]), Stroke::new(1.0, colour.gamma_multiply(0.55)));
+        }
         // the correction under it: a curve of its own, thin and pale, with no handles
         let lies_under = self.settings.correction();
         if lies_under != Curve::default() {
@@ -946,7 +1023,19 @@ pub fn open(start: Start) -> Result<(), String> {
     if start.settings.get().points().is_empty() {
         start.settings.set_points(&first_points());
     }
-    let mode = start.mode.and_then(|name| eq::mode(&name).ok()).map_or(String::new(), |m| m.name);
+    let mut mode = start.mode.and_then(|name| eq::mode(&name).ok()).map_or(String::new(), |m| m.name);
+    // nothing asked for: the mode it was left in last time; and that mode's own Bass and Sharpness
+    let mut tones = Tones::kept();
+    let modes = eq::modes()?;
+    if let (true, Some(last)) = (mode.is_empty() && !start.curve_given, modes.iter().find(|m| m.name == tones.last)) {
+        start.settings.set_all(&last.gains);
+        mode = last.name.clone();
+    }
+    let tone_mode = if mode.is_empty() { BY_HAND.to_string() } else { mode.clone() };
+    match start.tone_given {
+        true => tones.set(&tone_mode, start.settings.tone().0, start.settings.tone().1),
+        false => start.settings.set_tone(tones.of(&tone_mode).0, tones.of(&tone_mode).1),
+    }
     // Linux: nothing is taken from anyone by starting, so it starts as soon as it knows where to play
     let begin = (start.exclusive.is_some() || cfg!(target_os = "linux")) && source.is_some() && target.is_some();
     let inputs = std::thread::spawn(audio::inputs).join().map_err(|_| "the microphones could not be listed".to_string())?.unwrap_or_default();
@@ -962,8 +1051,10 @@ pub fn open(start: Start) -> Result<(), String> {
         running: None,
         ring: Arc::new(Ring::new(4 * SIZE)),
         spectrum: Spectrum::new(),
-        modes: eq::modes()?,
+        modes,
         mode,
+        tones,
+        tone_mode,
         on_top: true,
         held: None,
         menu: (None, Pos2::ZERO),

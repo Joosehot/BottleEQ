@@ -42,6 +42,8 @@
 //!   --mode <name>            a mode from modes.txt, e.g. --mode "bass boost"
 //!   --calibration <name>     a calibration kept (its bands and points), e.g. --calibration speakers
 //!   --volume <dB>            the whole sound louder (up to +18) or quieter; a limiter keeps it from clipping
+//!   --bass <dB>              a low shelf at 100 Hz and a high shelf at 4 kHz (-6 to +12 dB each), on top
+//!   --sharpness <dB>         of whatever mode, points and calibration are set
 //!   --points <points>        points on top of the bands, as in FL Studio's EQ: each a filter of its own,
 //!                            e.g. --points "100:cut 1k:-2 12k:+8:spike" (a slope at the start, a dip, a
 //!                            spike at the end); see `points_of` for how a point is written
@@ -53,7 +55,7 @@
 //! put on top of it and leave it as it is, and so does "flat".
 //!
 //! While `run` plays, a line sets the curve: "mode rock", "modes", "points 100:cut 12k:+8:spike", "1k +3",
-//! "calibration speakers", "calibration none",
+//! "calibration speakers", "calibration none", "bass +6", "sharpness +3",
 //! "31.5 -2", "8 4" (the 8th band), "flat", "off", "on"; an empty line stops.
 //!
 //! The window begins at once when --exclusive or --shared is given with both devices; else it waits for
@@ -274,6 +276,9 @@ fn show_gains(gains: &Settings, rate: u32) {
     if !points.is_empty() {
         println!("points:     {}", points.join(" | "));
     }
+    if gains.tone() != (0.0, 0.0) {
+        println!("on top:     bass {:+.1} dB, sharpness {:+.1} dB", gains.tone().0, gains.tone().1);
+    }
     let under = gains.correction();
     if under != eq::Curve::default() {
         println!("under it, the correction: bands {} and {} points{}", under.gains.iter().map(|g| format!("{g:+.1}")).collect::<Vec<_>>().join(" "), under.points().len(), if gains.correcting.load(Ordering::Relaxed) { "" } else { " (left out)" });
@@ -340,6 +345,8 @@ fn main() {
     let (calibration_text, save_text) = (take("--calibration"), take("--save"));
     let (kind, like_text) = (take("--type").unwrap_or("speakers".to_string()), take("--like"));
     let volume: f32 = take("--volume").map(|s| s.parse().unwrap_or_else(|_| fail("--volume takes a number of dB, like +6"))).unwrap_or(0.0);
+    let tone = |given: Option<String>, flag: &str| given.map(|s| s.parse::<f32>().unwrap_or_else(|_| fail(&format!("{flag} takes a number of dB, like +6"))));
+    let (bass, sharpness) = (tone(take("--bass"), "--bass"), tone(take("--sharpness"), "--sharpness"));
     let (gains_text, mode_text, points_text) = (take("--gains"), take("--mode"), take("--points"));
     let (shot, drag) = (take("--shot"), take("--drag"));
     let seconds: Option<f32> = take("--seconds").map(|s| s.parse().unwrap_or_else(|_| fail("--seconds takes a number")));
@@ -357,6 +364,7 @@ fn main() {
     let how = if gentle { &calibrate::GENTLE } else { &calibrate::EXACT };
     let gains = Arc::new(Settings::default());
     gains.set_volume(volume);
+    gains.set_tone(bass.unwrap_or(0.0), sharpness.unwrap_or(0.0));
     let given = gains_text.map(|g| parse_gains(&g));
     given.iter().flatten().enumerate().for_each(|(b, g)| gains.set(b, *g));
     // a mode is a named set of the ten bands' gains; points are filters of their own on top
@@ -394,6 +402,8 @@ fn main() {
                 to,
                 exclusive: if exclusive { Some(true) } else if shared { Some(false) } else { None },
                 cushion_ms,
+                tone_given: bass.is_some() || sharpness.is_some(),
+                curve_given: given.is_some() || points_text.is_some(),
                 settings: gains,
                 mode: mode_text,
                 play: file.map(|f| (f, level)),
@@ -648,6 +658,8 @@ fn main() {
                         Err(e) => println!("{e}"),
                     },
                     ["volume", db] if db.parse::<f32>().is_ok() => g.set_volume(db.parse().unwrap_or(0.0)),
+                    ["bass", db] if db.parse::<f32>().is_ok() => g.set_tone(db.parse().unwrap_or(0.0), g.tone().1),
+                    ["sharpness", db] if db.parse::<f32>().is_ok() => g.set_tone(g.tone().0, db.parse().unwrap_or(0.0)),
                     ["calibration", "none"] => g.set_correction(&[0.0; BANDS], &[]),
                     ["calibration", name @ ..] if !name.is_empty() => match calibrate::calibration(&name.join(" ")) {
                         Ok(calibration) => {

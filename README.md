@@ -7,6 +7,14 @@ Free, open-source speaker calibration and EQ for Windows and Linux. Make your sp
 - **EQ:** shape the sound yourself, like a bass boost.
 - **Compare:** toggle on/off to hear the difference.
 
+## New features
+- **Bass and Sharpness sliders:** more deep bass or more crispness on top of any mode.
+- **Speaker protection:** boosts never clip, and a limiter holds heavy bass back (the window warns when it works).
+- **Each mode remembers its sliders**, and the window opens in the mode you left it in.
+- **EQ ON / BYPASSED:** one button to hear the difference.
+- **Camera mic warning:** you are told if the calibration mic is a webcam's.
+- **Windows download:** no build needed, and no terminal window beside the app.
+
 ## Mic tips
 - Use a decent mic (a cheap USB mic is fine).
 - Don't use webcam or laptop mics, they ruin the measurement.
@@ -106,6 +114,8 @@ another.
   thread moves each gain 0.25 dB and each frequency 6% a block (about 3 ms) toward what is set.
 - **No clipping.** The whole sound is turned down by the highest point of the curve (headroom), so a
   raised curve cannot push a full-scale sound over. Raising part of it therefore makes the rest quieter.
+  The headroom goes down at once and comes back up no faster than a gain comes down, so the sound
+  does not swell while a curve is being lowered.
 
 ### Modes
 
@@ -159,6 +169,38 @@ Measured:
   wide against the curve's bend.) No gap, delay 5.9 ms on average and 8.1 ms at the longest.
 
 Heard by its owner through the window (2026-11-21).
+
+### Bass & Sharpness
+
+Two sliders at the top of the window, each from -6 to +12 dB in steps of 0.5, with a button beside each
+that puts it back to 0:
+
+- **Bass** is a low shelf at 100 Hz: more (or less) of everything below it, for bass-heavy music.
+- **Sharpness** is a high shelf at 4 kHz: more (or less) clarity and crispness.
+
+They **stack on top of any mode**: Flat, Deep Bass, Vocal and the others set the ten bands, and the
+sliders are a layer of their own run after the mode and after the calibration's correction, in the
+same chain of filters (no added delay). Changing the mode, the points or the calibration leaves them
+where they are, and BYPASSED takes them out with everything else. The thick amber curve in the graph
+is all of it together (calibration + mode + sliders), drawn as it is set; the curve the handles lie
+on is drawn thin beside it when the two differ.
+
+- **Each mode keeps its own two.** Deep Bass with Bass at +6 comes back at +6 when it is chosen again.
+  They are kept in `tone.txt` in the folder Bottle EQ is run from, with the mode last used: the window
+  opens in that mode.
+- **Speaker protection.** When the boost goes up the whole sound is turned down by the same amount
+  (the highest point of all three curves together), so a full-scale sound still fits. With the
+  Volume turned up past that, a limiter at the very end holds the loudest moments back: the whole
+  sound is turned down just enough the moment it would go over full scale, and held there through a
+  bass wave so the wave keeps its shape. The window says "⚠ limiter working" while it does. It keeps
+  the sound from clipping; it cannot know what a speaker's cone can take, so very deep bass at a
+  high volume is still the listener's to judge.
+- On the command line: `--bass <dB>`, `--sharpness <dB>`, and "bass +6", "sharpness +3" as lines in `run`.
+
+Tested in the engine (`cargo test`): what comes out is what the curves say within 0.05 dB; modes
+changed, the sliders pulled from end to end and the equalizer switched off and on with both sliders
+up make no jump in a sine at 60 Hz, 1 kHz or 6 kHz (none over 4.5 times the sine's own steepest step); Deep Bass with both sliders at +12 dB and the
+Volume at +18 dB on a full-scale 50 Hz sine never passes full scale and comes out a sine still.
 
 ## Measure and calibrate
 
