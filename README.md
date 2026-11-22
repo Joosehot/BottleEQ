@@ -29,6 +29,15 @@ Two tested starting points, both on top of a finished calibration in Flat mode:
 Tested on small speakers without a subwoofer. With a sub or bigger speakers you can push the Bass further.
 Calibrate first: these settings stack on top of the calibration.
 
+## Tested by ear
+I've tested Bottle EQ by ear on cheap €90 speakers without a subwoofer, across classical (Dvořák,
+Tchaikovsky, Paganini, Tartini), classical guitar (Lauro, Granados, Cardoso), film scores (Hans Zimmer),
+jazz-flavoured soundtracks (La La Land), pop and vocals (ABBA, Frank Sinatra), bass-heavy music
+(Basshunter, Avicii), podcasts, and YouTube videos (rally, car sounds). After calibration, my honest
+impression is that it sounds roughly 50% better than with the EQ off: clearer voices, tighter bass, and
+no cracking at high volume. This is a personal listening impression, not a lab measurement. Your room and
+speakers will differ, so calibrate and flip the on/off switch to hear it yourself.
+
 ## Mic tips
 - Use a decent mic (a cheap USB mic is fine).
 - Don't use webcam or laptop mics, they ruin the measurement.
