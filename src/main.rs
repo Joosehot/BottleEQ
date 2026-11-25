@@ -60,6 +60,7 @@
 
 mod audio;
 mod calibrate;
+mod calibration;
 mod eq;
 mod measure;
 mod ring;
